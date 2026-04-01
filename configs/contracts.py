@@ -196,7 +196,7 @@ class PredictionRecord(TypedDict):
 
 class EvalResult(TypedDict, total=False):
     """Dictionary returned by :meth:`evaluation.vqa_eval.VQAEvaluator.compute_accuracy`
-    and by :meth:`training.trainer.VQATrainer.evaluate`.
+    yes_no:  float
 
     ★ overall  : float  — Mean VQA accuracy over all questions (0.0 – 1.0 scale,
                            i.e. NOT percentage).
