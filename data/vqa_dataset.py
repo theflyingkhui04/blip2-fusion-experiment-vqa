@@ -1,16 +1,56 @@
-"""VQA dataset loader for VQAv2."""
+"""VQAv2 Dataset — canonical merged version.
+
+Base: Sprint-2 VQAv2Dataset (Task 11+12), extended with:
+  - Answer normalisation helpers (used by evaluator)
+  - Soft-target answer score computation (_get_answer_scores)
+  - Optional pre-built answer-vocab loading from answer_list.json
+  - Graceful blank-image fallback instead of zero-tensor
+  - All output keys aligned with configs/contracts.py
+
+COCO 2014 filenames: COCO_{train,val}2014_000000XXXXXX.jpg
+
+Usage (config-object interface, primary):
+    from data.vqa_dataset import VQAv2Dataset, build_dataloader
+    loader = build_dataloader("train", config, use_cache=True)
+
+Usage (legacy alias):
+    from data.vqa_dataset import VQADataset, build_vqa_dataloader
+"""
 
 from __future__ import annotations
 
 import json
 import os
+import random
+from collections import Counter
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Dict, List, Optional
 
+import h5py
 import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+from transformers import AutoTokenizer
+
+from configs.contracts import (
+    ANSWER_VOCAB_SIZE,
+    IMAGE_SIZE,
+    KEY_ANSWER_LABEL,
+    KEY_ANSWER_SCORES,
+    KEY_ANSWER_TEXT,
+    KEY_ANSWER_TYPE,
+    KEY_ANSWERS,
+    KEY_ATTENTION_MASK,
+    KEY_IMAGE_FEATURES,
+    KEY_IMAGE_IDS,
+    KEY_INPUT_IDS,
+    KEY_PIXEL_VALUES,
+    KEY_QUESTION_IDS,
+    KEY_QUESTION_TEXT,
+    MAX_QUESTION_LENGTH,
+    VQA_SCORE_DENOMINATOR,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -94,202 +134,417 @@ def normalize_answer(answer: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Dataset
+# Answer vocabulary builder
 # ---------------------------------------------------------------------------
 
 
-class VQADataset(Dataset):
-    """Dataset for VQAv2.
+def build_answer_vocab(annotation_file: str, top_k: int = ANSWER_VOCAB_SIZE) -> Dict[str, int]:
+    """Count answer frequencies from a VQAv2 annotations JSON; keep top_k.
+
+    Answers are normalised before counting so the vocab is canonical.
 
     Args:
-        question_file: Path to VQAv2 questions JSON.
-        annotation_file: Path to VQAv2 annotations JSON (optional for test split).
-        image_dir: Directory containing COCO images.
-        answer_list_file: Path to JSON file with list of answer vocab strings.
-        transform: Image transform; defaults to a standard resize/normalize.
-        max_question_length: Truncation length for questions.
-        is_train: Whether this is a training split (enables answer sampling).
+        annotation_file: Path to VQAv2 annotations JSON (train split recommended).
+        top_k: Vocabulary size (default ANSWER_VOCAB_SIZE = 3129).
+
+    Returns:
+        ``{normalised_answer: index}`` ordered by descending frequency.
+    """
+    with open(annotation_file) as f:
+        data = json.load(f)
+    counter: Counter = Counter()
+    for ann in data["annotations"]:
+        for a in ann["answers"]:
+            counter[normalize_answer(a["answer"])] += 1
+    return {ans: idx for idx, (ans, _) in enumerate(counter.most_common(top_k))}
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
+_DEFAULT_TRANSFORM = transforms.Compose([
+    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize(
+        mean=[0.48145466, 0.4578275, 0.40821073],
+        std=[0.26862954, 0.26130258, 0.27577711],
+    ),
+])
+
+
+class VQAv2Dataset(Dataset):
+    """VQAv2 dataset supporting HDF5 pre-extracted feature cache and raw COCO images.
+
+    Primary interface — takes a config object:
+
+        dataset = VQAv2Dataset("train", config, use_cache=True)
+
+    Config object must expose ``config.data.*`` with the keys defined in
+    :class:`configs.contracts.DataConfig` (Sprint-2 style).
+
+    Args:
+        split:     ``"train"`` or ``"val"``.
+        config:    Config object with a ``.data`` attribute (OmegaConf or similar).
+        use_cache: Load pre-extracted HDF5 features instead of raw images.
+                   Cache must be created first with ``scripts/pre_extract_features.py``.
     """
 
-    def __init__(
-        self,
-        question_file: str,
-        annotation_file: Optional[str],
-        image_dir: str,
-        answer_list_file: Optional[str] = None,
-        transform: Optional[Callable] = None,
-        max_question_length: int = 50,
-        is_train: bool = True,
-    ) -> None:
-        super().__init__()
-        self.image_dir = Path(image_dir)
-        self.max_question_length = max_question_length
-        self.is_train = is_train
+    #: Mapping from split name to file/directory metadata.
+    SPLIT_FILES = {
+        "train": {
+            "ann":        "v2_mscoco_train2014_annotations.json",
+            "ques":       "v2_OpenEnded_mscoco_train2014_questions.json",
+            "img_dir":    "train2014",
+            "img_prefix": "COCO_train2014_",
+            "cache":      "train_features.h5",
+        },
+        "val": {
+            "ann":        "v2_mscoco_val2014_annotations.json",
+            "ques":       "v2_OpenEnded_mscoco_val2014_questions.json",
+            "img_dir":    "val2014",
+            "img_prefix": "COCO_val2014_",
+            "cache":      "val_features.h5",
+        },
+    }
 
-        # Load questions
-        with open(question_file, "r") as f:
-            question_data = json.load(f)
-        self.questions: List[Dict] = question_data["questions"]
+    def __init__(self, split: str, config, use_cache: bool = True) -> None:
+        assert split in ("train", "val"), f"split must be 'train' or 'val', got '{split}'"
+        self.split = split
+        self.use_cache = use_cache
 
-        # Build question-id → question map
-        self._qid_to_question: Dict[int, Dict] = {
-            q["question_id"]: q for q in self.questions
+        cfg = config.data
+        data_root = cfg.data_root
+        meta = self.SPLIT_FILES[split]
+
+        ann_path  = os.path.join(data_root, cfg.vqav2_dir, meta["ann"])
+        ques_path = os.path.join(data_root, cfg.vqav2_dir, meta["ques"])
+        self.image_dir  = os.path.join(data_root, cfg.coco_dir, meta["img_dir"])
+        self.img_prefix = meta["img_prefix"]
+        self._img_size  = int(getattr(cfg, "image_size", IMAGE_SIZE))
+
+        # ── Load questions + annotations, merge into self.samples ────────────
+        with open(ann_path) as f:
+            ann_data = json.load(f)
+        with open(ques_path) as f:
+            ques_data = json.load(f)
+
+        qid2question = {q["question_id"]: q["question"] for q in ques_data["questions"]}
+        self.samples: List[Dict] = []
+        for ann in ann_data["annotations"]:
+            qid = ann["question_id"]
+            question = qid2question.get(qid, "")
+            if not question:
+                continue
+            raw_answers = [a["answer"] for a in ann["answers"]]
+            self.samples.append({
+                "question_id": qid,
+                "image_id":    ann["image_id"],
+                "question":    question,
+                "answers":     raw_answers,
+                "answer":      ann.get("multiple_choice_answer",
+                                       raw_answers[0] if raw_answers else ""),
+                "answer_type": ann.get("answer_type", "other"),
+            })
+
+        # ── Stratified subset selection ──────────────────────────────────────
+        subset_size = int(cfg.train_size if split == "train" else cfg.val_size)
+        seed = int(getattr(cfg, "seed", 42))
+        indices = VQAv2Dataset._stratified_indices(self.samples, subset_size, seed)
+        self.samples = [self.samples[i] for i in indices]
+
+        # ── Image transform ──────────────────────────────────────────────────
+        self.transform = transforms.Compose([
+            transforms.Resize((self._img_size, self._img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.48145466, 0.4578275, 0.40821073],
+                std=[0.26862954, 0.26130258, 0.27577711],
+            ),
+        ])
+
+        # ── Answer vocabulary ────────────────────────────────────────────────
+        # Priority 1: pre-built answer_list file from config (if present)
+        # Priority 2: build dynamically from this split's annotation file
+        answer_list_path = getattr(cfg, "answer_list", None)
+        if answer_list_path and os.path.exists(str(answer_list_path)):
+            with open(answer_list_path) as f:
+                raw_vocab = json.load(f)
+            self.idx_to_answer: List[str] = [normalize_answer(a) for a in raw_vocab]
+            self.answer_to_idx: Dict[str, int] = {
+                a: i for i, a in enumerate(self.idx_to_answer)
+            }
+        else:
+            self.answer_to_idx = build_answer_vocab(ann_path, top_k=ANSWER_VOCAB_SIZE)
+            self.idx_to_answer = [""] * len(self.answer_to_idx)
+            for ans, idx in self.answer_to_idx.items():
+                self.idx_to_answer[idx] = ans
+
+        # ── HDF5 cache ───────────────────────────────────────────────────────
+        self._h5 = None
+        if use_cache:
+            self._h5_path = os.path.join(data_root, cfg.cache_dir, meta["cache"])
+            if not os.path.exists(self._h5_path):
+                raise FileNotFoundError(
+                    f"Cache not found: {self._h5_path}\n"
+                    "Run scripts/pre_extract_features.py first, or set use_cache=False."
+                )
+
+        print(f"[VQAv2Dataset/{split}] {len(self.samples):,} samples | "
+              f"vocab={len(self.answer_to_idx):,} | use_cache={use_cache}")
+
+    # ------------------------------------------------------------------
+    # Core Dataset interface
+    # ------------------------------------------------------------------
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Dict:
+        s = self.samples[idx]
+
+        item: Dict = {
+            "question_id": s["question_id"],
+            "image_id":    s["image_id"],
+            "question":    s["question"],
+            KEY_ANSWERS:   s["answers"],        # List[str] — all 10 raw answers
+            KEY_ANSWER_TEXT: s["answer"],       # str       — most common answer
+            KEY_ANSWER_TYPE: s["answer_type"],  # str       — "yes/no"|"number"|"other"
         }
 
-        # Load annotations (ground-truth answers) if provided
-        self._annotations: Dict[int, Dict] = {}
-        if annotation_file and os.path.exists(annotation_file):
-            with open(annotation_file, "r") as f:
-                ann_data = json.load(f)
-            for ann in ann_data["annotations"]:
-                self._annotations[ann["question_id"]] = ann
-
-        # Load answer vocabulary
-        self.answer_to_idx: Dict[str, int] = {}
-        self.idx_to_answer: List[str] = []
-        if answer_list_file and os.path.exists(answer_list_file):
-            with open(answer_list_file, "r") as f:
-                answers = json.load(f)
-            self.idx_to_answer = [normalize_answer(a) for a in answers]
-            self.answer_to_idx = {a: i for i, a in enumerate(self.idx_to_answer)}
-
-        # Image transform
-        if transform is not None:
-            self.transform = transform
+        # ── Image / features ─────────────────────────────────────────────────
+        if self.use_cache:
+            if self._h5 is None:                        # lazy open (DataLoader fork-safe)
+                self._h5 = h5py.File(self._h5_path, "r")
+            item[KEY_IMAGE_FEATURES] = torch.from_numpy(
+                self._h5[str(s["image_id"])][()].astype("float32")
+            )
         else:
-            self.transform = transforms.Compose([
-                transforms.Resize((224, 224)),
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=[0.48145466, 0.4578275, 0.40821073],
-                    std=[0.26862954, 0.26130258, 0.27577711],
-                ),
-            ])
+            p = os.path.join(self.image_dir,
+                             f"{self.img_prefix}{s['image_id']:012d}.jpg")
+            if os.path.exists(p):
+                img = Image.open(p).convert("RGB")
+            else:
+                img = Image.new("RGB", (self._img_size, self._img_size), color=128)
+            item[KEY_PIXEL_VALUES] = self.transform(img)
+
+        # ── Soft-target answer scores + hard label ───────────────────────────
+        if self.answer_to_idx:
+            item[KEY_ANSWER_SCORES] = self._get_answer_scores(s["answers"])
+            label_idx = self.answer_to_idx.get(normalize_answer(s["answer"]), -1)
+            item[KEY_ANSWER_LABEL] = torch.tensor(label_idx, dtype=torch.long)
+
+        return item
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def __len__(self) -> int:
-        return len(self.questions)
+    def _get_answer_scores(self, raw_answers: List[str]) -> torch.Tensor:
+        """Compute soft-target VQA score vector from raw answer strings.
 
-    def _image_filename(self, image_id: int) -> Path:
-        """Return the image file path for a given COCO image_id."""
-        filename = f"COCO_{'train' if self.is_train else 'val'}2014_{image_id:012d}.jpg"
-        path = self.image_dir / filename
-        if not path.exists():
-            # Fallback: bare id without split prefix
-            path = self.image_dir / f"{image_id:012d}.jpg"
-        return path
+        Score formula: ``min(count / VQA_SCORE_DENOMINATOR, 1.0)`` per answer.
 
-    def _get_answer_scores(self, question_id: int) -> torch.Tensor:
-        """Return a soft-target score vector over the answer vocabulary."""
+        Args:
+            raw_answers: List of up to 10 raw answer strings for one question.
+
+        Returns:
+            Float tensor of shape ``[ANSWER_VOCAB_SIZE]`` with values in ``[0, 1]``.
+        """
         scores = torch.zeros(len(self.answer_to_idx), dtype=torch.float)
-        if question_id not in self._annotations:
-            return scores
-        ann = self._annotations[question_id]
         answer_counts: Dict[str, int] = {}
-        for a in ann.get("answers", []):
-            norm = normalize_answer(a["answer"])
+        for ans in raw_answers:
+            norm = normalize_answer(ans)
             answer_counts[norm] = answer_counts.get(norm, 0) + 1
         for ans, count in answer_counts.items():
             if ans in self.answer_to_idx:
-                # VQA accuracy: min(count / 3, 1)
-                scores[self.answer_to_idx[ans]] = min(count / 3.0, 1.0)
+                scores[self.answer_to_idx[ans]] = min(
+                    count / VQA_SCORE_DENOMINATOR, 1.0
+                )
         return scores
 
-    # ------------------------------------------------------------------
-    # __getitem__
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _stratified_indices(
+        samples: List[Dict], subset_size: int, seed: int = 42
+    ) -> List[int]:
+        """Sample ``subset_size`` indices with stratification by ``answer_type``.
 
-    def __getitem__(self, idx: int) -> Dict:
-        question_info = self.questions[idx]
-        question_id = question_info["question_id"]
-        image_id = question_info["image_id"]
-        question_text = question_info["question"]
+        Each answer type gets a proportional share of the subset.  Remaining
+        slots (rounding differences) are filled randomly.
 
-        # Truncate question
-        words = question_text.split()
-        if len(words) > self.max_question_length:
-            question_text = " ".join(words[: self.max_question_length])
+        Args:
+            samples:     Full sample list with ``"answer_type"`` key.
+            subset_size: Desired number of samples.
+            seed:        Random seed for reproducibility.
 
-        # Load image
-        image_path = self._image_filename(image_id)
-        if image_path.exists():
-            image = Image.open(image_path).convert("RGB")
-        else:
-            # Return a blank image when file is not available (offline testing)
-            image = Image.new("RGB", (224, 224), color=128)
-        image = self.transform(image)
+        Returns:
+            List of integer indices into ``samples``.
+        """
+        rng = random.Random(seed)
+        type2idx: Dict[str, List[int]] = {}
+        for i, s in enumerate(samples):
+            type2idx.setdefault(s["answer_type"], []).append(i)
 
-        item = {
-            "question_id": question_id,
-            "image_id": image_id,
-            "image": image,
-            "question": question_text,
-        }
+        total = len(samples)
+        selected: List[int] = []
+        for indices in type2idx.values():
+            n = int(round(len(indices) / total * subset_size))
+            rng.shuffle(indices)
+            selected.extend(indices[:n])
 
-        # Add answer labels when annotations are available
-        if self._annotations:
-            ann = self._annotations.get(question_id, {})
-            answer_type = ann.get("answer_type", "other")
-            most_common = ann.get("multiple_choice_answer", "")
-            item["answer_type"] = answer_type
-            item["most_common_answer"] = normalize_answer(most_common)
-            if self.answer_to_idx:
-                item["answer_scores"] = self._get_answer_scores(question_id)
-                label = self.answer_to_idx.get(normalize_answer(most_common), -1)
-                item["answer_label"] = torch.tensor(label, dtype=torch.long)
+        if len(selected) > subset_size:
+            rng.shuffle(selected)
+            selected = selected[:subset_size]
+        elif len(selected) < subset_size:
+            remaining = list(set(range(total)) - set(selected))
+            rng.shuffle(remaining)
+            selected.extend(remaining[: subset_size - len(selected)])
 
-        return item
+        return selected
 
 
 # ---------------------------------------------------------------------------
-# DataLoader factory
+# Tokenizer (module-level singleton, DataLoader worker-safe)
 # ---------------------------------------------------------------------------
 
+_tokenizer = None
 
-def build_vqa_dataloader(
-    question_file: str,
-    annotation_file: Optional[str],
-    image_dir: str,
-    answer_list_file: Optional[str] = None,
-    transform: Optional[Callable] = None,
-    batch_size: int = 32,
-    num_workers: int = 4,
-    is_train: bool = True,
-    shuffle: Optional[bool] = None,
+
+def get_tokenizer(model_name: str = "bert-base-uncased") -> AutoTokenizer:
+    """Return a cached BERT tokenizer (loaded once per process)."""
+    global _tokenizer
+    if _tokenizer is None:
+        _tokenizer = AutoTokenizer.from_pretrained(model_name)
+    return _tokenizer
+
+
+# ---------------------------------------------------------------------------
+# collate_fn  — keys aligned with configs/contracts.py
+# ---------------------------------------------------------------------------
+
+def collate_fn(batch: List[Dict]) -> Dict:
+    """Collate a list of :meth:`VQAv2Dataset.__getitem__` dicts into a batch.
+
+    Key mapping (all names from contracts.KEY_*):
+        input_ids      — tokenized question ids      [B, MAX_QUESTION_LENGTH]
+        attention_mask — padding mask                [B, MAX_QUESTION_LENGTH]
+        question_text  — raw question strings        List[str]
+        question_ids   — VQAv2 question_id           List[int]
+        image_ids      — COCO image_id               List[int]
+        answer         — most common answer          List[str]
+        answers        — all 10 raw answers          List[List[str]]
+        answer_type    — answer type string          List[str]
+        pixel_values   — raw image tensor            [B, 3, H, W]   (use_cache=False)
+        image_features — pre-extracted features      [B, N, D]      (use_cache=True)
+        answer_scores  — soft-target VQA scores      [B, ANSWER_VOCAB_SIZE]
+        answer_label   — hard label index            [B]
+    """
+    tokenizer = get_tokenizer()
+    questions = [b["question"] for b in batch]
+    enc = tokenizer(
+        questions,
+        padding=True,
+        truncation=True,
+        max_length=MAX_QUESTION_LENGTH,
+        return_tensors="pt",
+    )
+
+    result: Dict = {
+        KEY_INPUT_IDS:      enc["input_ids"],
+        KEY_ATTENTION_MASK: enc["attention_mask"],
+        KEY_QUESTION_TEXT:  questions,
+        KEY_QUESTION_IDS:   [b["question_id"]     for b in batch],
+        KEY_IMAGE_IDS:      [b["image_id"]        for b in batch],
+        KEY_ANSWER_TEXT:    [b[KEY_ANSWER_TEXT]   for b in batch],
+        KEY_ANSWERS:        [b[KEY_ANSWERS]       for b in batch],
+        KEY_ANSWER_TYPE:    [b[KEY_ANSWER_TYPE]   for b in batch],
+    }
+
+    # Exactly one of image_features / pixel_values is present per batch
+    if KEY_IMAGE_FEATURES in batch[0]:
+        result[KEY_IMAGE_FEATURES] = torch.stack([b[KEY_IMAGE_FEATURES] for b in batch])
+    else:
+        result[KEY_PIXEL_VALUES] = torch.stack([b[KEY_PIXEL_VALUES] for b in batch])
+
+    # Optional: answer supervision tensors (absent when vocab not loaded)
+    if KEY_ANSWER_SCORES in batch[0]:
+        result[KEY_ANSWER_SCORES] = torch.stack([b[KEY_ANSWER_SCORES] for b in batch])
+    if KEY_ANSWER_LABEL in batch[0]:
+        result[KEY_ANSWER_LABEL] = torch.stack([b[KEY_ANSWER_LABEL] for b in batch])
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# DataLoader factory (primary)
+# ---------------------------------------------------------------------------
+
+def build_dataloader(
+    split: str,
+    config,
+    use_cache: bool = True,
 ) -> DataLoader:
-    """Convenience function to construct a :class:`VQADataset` DataLoader.
+    """Build a stratified DataLoader for a VQAv2 split.
 
     Args:
-        question_file: Path to the VQAv2 questions JSON file.
-        annotation_file: Path to the VQAv2 annotations JSON (``None`` for test split).
-        image_dir: Directory containing COCO images.
-        answer_list_file: Path to the answer-vocabulary JSON.
-        transform: Optional image transform.
-        batch_size: Batch size.
-        num_workers: Number of DataLoader worker processes.
-        is_train: Whether this split is used for training.
-        shuffle: Whether to shuffle the dataset; defaults to ``is_train``.
+        split:     ``"train"`` or ``"val"``.
+        config:    Config object with ``config.data.*`` attributes.
+        use_cache: Use pre-extracted HDF5 features (requires cache file).
 
     Returns:
-        A PyTorch :class:`~torch.utils.data.DataLoader`.
+        A :class:`torch.utils.data.DataLoader` with :func:`collate_fn` applied.
     """
-    dataset = VQADataset(
-        question_file=question_file,
-        annotation_file=annotation_file,
-        image_dir=image_dir,
-        answer_list_file=answer_list_file,
-        transform=transform,
-        is_train=is_train,
-    )
-    if shuffle is None:
-        shuffle = is_train
+    dataset = VQAv2Dataset(split, config, use_cache=use_cache)
     return DataLoader(
         dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
+        batch_size=int(config.data.batch_size),
+        shuffle=(split == "train"),
+        num_workers=int(getattr(config.data, "num_workers", 4)),
+        collate_fn=collate_fn,
         pin_memory=True,
+        drop_last=(split == "train"),
     )
+
+
+# ---------------------------------------------------------------------------
+# Backward-compat aliases
+# ---------------------------------------------------------------------------
+
+#: Alias for users/scripts that import the original class name.
+VQADataset = VQAv2Dataset
+
+#: Alias kept for scripts that import ``build_vqa_dataloader``.
+build_vqa_dataloader = build_dataloader
+
+
+# ---------------------------------------------------------------------------
+# Quick smoke-test
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    from omegaconf import OmegaConf
+
+    cfg = OmegaConf.create({
+        "data": {
+            "data_root":  "/content/data",
+            "vqav2_dir":  "vqav2",
+            "coco_dir":   "coco",
+            "cache_dir":  "cache",
+            "train_size": 512,
+            "val_size":   128,
+            "image_size": IMAGE_SIZE,
+            "seed":       42,
+            "batch_size": 8,
+            "num_workers": 0,
+        },
+        "model": {
+            "image_encoder": "openai/clip-vit-large-patch14",
+        },
+    })
+
+    loader = build_dataloader("train", cfg, use_cache=False)
+    batch  = next(iter(loader))
+    print("input_ids:    ", batch[KEY_INPUT_IDS].shape)
+    print("pixel_values: ", batch[KEY_PIXEL_VALUES].shape)
+    print("question_ids: ", batch[KEY_QUESTION_IDS][:3])
+    print("answer_scores:", batch[KEY_ANSWER_SCORES].shape)

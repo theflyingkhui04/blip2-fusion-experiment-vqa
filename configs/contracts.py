@@ -47,13 +47,18 @@ import torch
 
 # ── Batch keys ──────────────────────────────────────────────────────────────
 KEY_PIXEL_VALUES    = "pixel_values"       # torch.Tensor [B, 3, H, W] float32
-KEY_INPUT_IDS       = "input_ids"          # torch.Tensor [B, L]       int64
+KEY_IMAGE_FEATURES  = "image_features"     # torch.Tensor [B, N_tokens, CLIP_DIM] float32 (pre-extracted)
+KEY_INPUT_IDS       = "input_ids"          # torch.Tensor [B, L]       int64  (tokenized question)
 KEY_ATTENTION_MASK  = "attention_mask"     # torch.Tensor [B, L]       int64 0/1
 KEY_ANSWER_SCORES   = "answer_scores"      # torch.Tensor [B, V]       float32  ∈ [0,1]
+KEY_ANSWER_LABEL    = "answer_label"       # torch.Tensor [B]          int64  (hard label index, -1 = OOV)
 KEY_LABELS          = "labels"             # torch.Tensor [B, L]       int64   (-100 = ignore)
-KEY_QUESTION_IDS    = "question_ids"       # List[int]
-KEY_QUESTION_TEXT   = "question_text"      # List[str]
-KEY_IMAGE_IDS       = "image_ids"          # List[int]
+KEY_QUESTION_IDS    = "question_ids"       # List[int]   — VQAv2 question_id for each sample
+KEY_QUESTION_TEXT   = "question_text"      # List[str]   — raw question strings
+KEY_IMAGE_IDS       = "image_ids"          # List[int]   — COCO image_id for each sample
+KEY_ANSWER_TEXT     = "answer"             # List[str]   — most common answer string (singular)
+KEY_ANSWERS         = "answers"            # List[List[str]] — all 10 raw answer strings
+KEY_ANSWER_TYPE     = "answer_type"        # List[str]   — "yes/no" | "number" | "other"
 
 # ── Model output keys ────────────────────────────────────────────────────────
 KEY_LOSS            = "loss"               # torch.Tensor scalar
@@ -111,14 +116,22 @@ class VQABatch(TypedDict, total=False):
                        Only present in generative training.
     """
 
-    pixel_values:   torch.Tensor
-    input_ids:      torch.Tensor
-    attention_mask: torch.Tensor
-    question_ids:   List[int]
-    question_text:  List[str]
-    image_ids:      List[int]
-    answer_scores:  torch.Tensor
-    labels:         torch.Tensor
+    # ── Image (exactly one of the two will be present per batch) ──────────────
+    pixel_values:   torch.Tensor    # [B, 3, IMAGE_SIZE, IMAGE_SIZE]   when use_cache=False
+    image_features: torch.Tensor    # [B, CLIP_PATCH_TOKENS, CLIP_DIM] when use_cache=True
+    # ── Question ────────────────────────────────────────────────────────────────
+    input_ids:      torch.Tensor    # [B, MAX_QUESTION_LENGTH]  tokenized
+    attention_mask: torch.Tensor    # [B, MAX_QUESTION_LENGTH]
+    question_ids:   List[int]       # VQAv2 question_id
+    question_text:  List[str]       # raw question strings
+    image_ids:      List[int]       # COCO image_id
+    # ── Answer (absent on test split) ───────────────────────────────────────────
+    answer_scores:  torch.Tensor    # [B, ANSWER_VOCAB_SIZE]  soft targets ∈ [0,1]
+    answer_label:   torch.Tensor    # [B]  hard label index (-1 = OOV)
+    answer:         List            # List[str]  most common answer
+    answers:        List            # List[List[str]]  all 10 answers
+    answer_type:    List            # List[str]  "yes/no"|"number"|"other"
+    labels:         torch.Tensor    # [B, L]  for generative training only
 
 
 # ===========================================================================
@@ -254,18 +267,36 @@ class ModelConfig(TypedDict, total=False):
 
 
 class DataConfig(TypedDict, total=False):
-    """``cfg["data"]`` block in default.yaml."""
+    """``cfg["data"]`` block.
 
-    train_annotation:    str   # path to v2_OpenEnded_mscoco_train2014_questions.json
-    val_annotation:      str   # path to v2_OpenEnded_mscoco_val2014_questions.json
-    train_answers:       str   # path to v2_mscoco_train2014_annotations.json
-    val_answers:         str   # path to v2_mscoco_val2014_annotations.json
-    train_image_dir:     str   # path to train2014/ directory
-    val_image_dir:       str   # path to val2014/ directory
-    answer_list:         str   # path to answer_list.json
-    max_question_length: int   # token truncation (default 50)
-    image_size:          int   # pixels (default 224; images resized to square)
-    num_workers:         int   # DataLoader worker count (default 4)
+    Sprint-2 config-object interface (used by VQAv2Dataset / build_dataloader):
+        data_root / vqav2_dir / coco_dir / cache_dir compose all paths internally.
+
+    Legacy flat-path interface (kept for backward compatibility):
+        train_annotation, val_annotation, … are full paths.
+    """
+
+    # ── Sprint-2 config-object fields ───────────────────────────────────────────
+    data_root:           str   # root directory for all data sub-folders
+    vqav2_dir:           str   # sub-folder with VQAv2 JSON files (relative to data_root)
+    coco_dir:            str   # sub-folder with COCO images       (relative to data_root)
+    cache_dir:           str   # sub-folder for HDF5 feature cache (relative to data_root)
+    train_size:          int   # number of training samples after stratified subset
+    val_size:            int   # number of validation samples after stratified subset
+    seed:                int   # random seed for stratified sampling
+    batch_size:          int   # batch size used by build_dataloader
+    # ── Shared ──────────────────────────────────────────────────────────────────
+    answer_list:         str   # optional path to pre-built answer vocab JSON
+    max_question_length: int   # token truncation length (default 50)
+    image_size:          int   # resize target (default 224)
+    num_workers:         int   # DataLoader worker processes (default 4)
+    # ── Legacy flat-path fields (backward compat) ───────────────────────────────
+    train_annotation:    str   # full path to v2_OpenEnded_mscoco_train2014_questions.json
+    val_annotation:      str   # full path to v2_OpenEnded_mscoco_val2014_questions.json
+    train_answers:       str   # full path to v2_mscoco_train2014_annotations.json
+    val_answers:         str   # full path to v2_mscoco_val2014_annotations.json
+    train_image_dir:     str   # full path to train2014/ directory
+    val_image_dir:       str   # full path to val2014/ directory
 
 
 class TrainingConfig(TypedDict, total=False):
@@ -358,6 +389,10 @@ IMAGE_SIZE: int = 224
 NUM_QUERY_TOKENS: int = 32
 QFORMER_HIDDEN_SIZE: int = 768
 VISION_ENCODER_WIDTH: int = 1408   # EVA-CLIP ViT-g/14
+
+# CLIP ViT-L/14 feature dimensions (used by pre_extract_features.py)
+CLIP_FEATURE_DIM: int = 1024    # ViT-L/14 output channel dimension
+CLIP_PATCH_TOKENS: int = 257    # 1 CLS + 256 patch tokens at 224×224
 
 # Question tokenisation
 MAX_QUESTION_LENGTH: int = 50
