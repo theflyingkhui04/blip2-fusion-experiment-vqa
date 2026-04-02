@@ -1,7 +1,8 @@
-"""Training loop for BLIP-2 VQA experiments."""
+"""Vòng lặp huấn luyện cho các thí nghiệm BLIP-2 VQA."""
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import time
@@ -15,29 +16,46 @@ from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from configs.contracts import (
+    KEY_ANSWER_LABEL,
+    KEY_ANSWER_SCORES,
+    KEY_ATTENTION_MASK,
+    KEY_BEST_VAL_METRIC,
+    KEY_EPOCH,
+    KEY_GLOBAL_STEP,
+    KEY_INPUT_IDS,
+    KEY_LOGITS,
+    KEY_LOSS,
+    KEY_MODEL_STATE,
+    KEY_OPTIM_STATE,
+    KEY_PIXEL_VALUES,
+    KEY_SCHED_STATE,
+    LOSS_BCE,
+    EvalResult,
+)
 from training.losses import VQALoss
 
 logger = logging.getLogger(__name__)
 
 
 class VQATrainer:
-    """Training / evaluation coordinator for VQA models.
+    """Bộ điều phối huấn luyện / đánh giá cho các mô hình VQA.
 
     Args:
-        model: The model to train.
-        train_loader: DataLoader for the training split.
-        val_loader: DataLoader for the validation split.
+        model: Mô hình cần huấn luyện.
+        train_loader: DataLoader cho tập huấn luyện.
+        val_loader: DataLoader cho tập validation.
         optimizer: PyTorch optimizer.
-        scheduler: Learning-rate scheduler (optional).
-        loss_fn: Loss module; defaults to :class:`~training.losses.VQALoss`.
-        device: Torch device string (e.g. ``"cuda"`` or ``"cpu"``).
-        output_dir: Directory for saving checkpoints and logs.
-        gradient_accumulation_steps: Number of steps before an optimizer step.
-        gradient_clip: Max gradient norm (0 = disabled).
-        mixed_precision: Enable automatic mixed precision (AMP).
-        eval_metric_fn: Optional callable ``(predictions, targets) → float``
-            used to compute a scalar validation metric.
-        log_every: Log training stats every *N* optimizer steps.
+        scheduler: Learning-rate scheduler (tuỳ chọn).
+        loss_fn: Module tính loss; mặc định là :class:`~training.losses.VQALoss`.
+        device: Thiết bị Torch (ví dụ. ``"cuda"`` hoặc ``"cpu"``).
+        output_dir: Thư mục lưu checkpoint và log.
+        gradient_accumulation_steps: Số bước tích luỹ gradient trước mỗi optimizer step.
+        gradient_clip: Max-norm cho gradient clipping (0 = tắt).
+        mixed_precision: Bật Automatic Mixed Precision (AMP).
+        eval_metric_fn: Callable tuỳ chọn ``(predictions, targets) → float``
+            dùng để tính metric scalar khi validation.
+        log_every: Ghi log mỗi *N* optimizer steps.
     """
 
     def __init__(
@@ -61,7 +79,7 @@ class VQATrainer:
         self.val_loader = val_loader
         self.optimizer = optimizer
         self.scheduler = scheduler
-        self.loss_fn = loss_fn or VQALoss(loss_type="bce")
+        self.loss_fn = loss_fn or VQALoss(loss_type=LOSS_BCE)
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -85,10 +103,10 @@ class VQATrainer:
     # ------------------------------------------------------------------
 
     def train(self, num_epochs: int) -> None:
-        """Train for *num_epochs* epochs.
+        """Huấn luyện trong *num_epochs* epoch.
 
         Args:
-            num_epochs: Number of training epochs.
+            num_epochs: Số epoch huấn luyện.
         """
         for epoch in range(1, num_epochs + 1):
             logger.info("=== Epoch %d / %d ===", epoch, num_epochs)
@@ -99,22 +117,23 @@ class VQATrainer:
                 "Epoch %d | train_loss=%.4f | val_loss=%.4f",
                 epoch,
                 train_loss,
-                val_results["loss"],
+                val_results[KEY_LOSS],
             )
 
-            # Scheduler step (epoch-level)
+            # Bước scheduler theo epoch
             if self.scheduler is not None:
                 self.scheduler.step()
 
-            # Save checkpoint
-            metric = val_results.get("metric", -val_results["loss"])
+            # Lưu checkpoint sau mỗi epoch
+            metric = val_results.get("metric", -val_results[KEY_LOSS])
             self._save_checkpoint(epoch, metric)
 
-    def evaluate(self) -> Dict[str, float]:
-        """Run a single evaluation pass over the validation set.
+    def evaluate(self) -> EvalResult:
+        """Chạy một lượt đánh giá trên tập validation.
 
         Returns:
-            Dictionary with at least ``"loss"`` and optionally ``"metric"``.
+            Dict có ít nhất khoá ``"loss"`` và tuỳ chọn ``"metric"``;
+            xem :class:`configs.contracts.EvalResult`.
         """
         return self._val_epoch(epoch=0)
 
@@ -177,7 +196,7 @@ class VQATrainer:
         return total_loss / num_batches
 
     @torch.no_grad()
-    def _val_epoch(self, epoch: int) -> Dict[str, float]:
+    def _val_epoch(self, epoch: int) -> EvalResult:
         self.model.eval()
         total_loss = 0.0
         all_preds, all_targets = [], []
@@ -189,10 +208,10 @@ class VQATrainer:
             if self.eval_metric_fn is not None:
                 preds = self._get_predictions(batch)
                 all_preds.extend(preds)
-                if "answer_label" in batch:
-                    all_targets.extend(batch["answer_label"].tolist())
+                if KEY_ANSWER_LABEL in batch:
+                    all_targets.extend(batch[KEY_ANSWER_LABEL].tolist())
 
-        results: Dict[str, float] = {"loss": total_loss / max(len(self.val_loader), 1)}
+        results: EvalResult = {KEY_LOSS: total_loss / max(len(self.val_loader), 1)}  # type: ignore[misc]
 
         if self.eval_metric_fn is not None and all_targets:
             results["metric"] = self.eval_metric_fn(all_preds, all_targets)
@@ -200,16 +219,26 @@ class VQATrainer:
         return results
 
     def _forward_batch(self, batch: Dict) -> torch.Tensor:
-        """Move batch to device and compute loss."""
-        pixel_values = batch["image"].to(self.device)
-        answer_scores = batch.get("answer_scores")
+        """Chuyển batch lên device và tính loss."""
+        # Lấy các tensor từ batch theo đúng key contract
+        pixel_values = batch[KEY_PIXEL_VALUES].to(self.device)
+
+        input_ids = batch.get(KEY_INPUT_IDS)
+        if input_ids is not None:
+            input_ids = input_ids.to(self.device)
+
+        attention_mask = batch.get(KEY_ATTENTION_MASK)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.device)
+
+        answer_scores = batch.get(KEY_ANSWER_SCORES)
         if answer_scores is not None:
             answer_scores = answer_scores.to(self.device)
-        answer_label = batch.get("answer_label")
+
+        answer_label = batch.get(KEY_ANSWER_LABEL)
         if answer_label is not None:
             answer_label = answer_label.to(self.device)
 
-        import contextlib
         ctx = (
             torch.cuda.amp.autocast()
             if self.scaler is not None
@@ -218,26 +247,40 @@ class VQATrainer:
         with ctx:
             out = self.model(
                 pixel_values=pixel_values,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
                 answer_scores=answer_scores,
             )
 
-        if "loss" in out:
-            return out["loss"]
+        # Nếu model đã tính loss nội bộ thì dùng trực tiếp
+        if KEY_LOSS in out:
+            return out[KEY_LOSS]
 
-        if "logits" in out:
+        # Ngược lại trainer tự tính loss từ logits
+        if KEY_LOGITS in out:
             targets = answer_scores if answer_scores is not None else answer_label
             if targets is None:
                 return torch.tensor(0.0, device=self.device, requires_grad=True)
-            return self.loss_fn(out["logits"], targets)
+            return self.loss_fn(out[KEY_LOGITS], targets)
 
         return torch.tensor(0.0, device=self.device, requires_grad=True)
 
     @torch.no_grad()
     def _get_predictions(self, batch: Dict):
-        pixel_values = batch["image"].to(self.device)
-        out = self.model(pixel_values=pixel_values)
-        if "logits" in out:
-            return out["logits"].argmax(dim=-1).tolist()
+        pixel_values = batch[KEY_PIXEL_VALUES].to(self.device)
+        input_ids = batch.get(KEY_INPUT_IDS)
+        if input_ids is not None:
+            input_ids = input_ids.to(self.device)
+        attention_mask = batch.get(KEY_ATTENTION_MASK)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.device)
+        out = self.model(
+            pixel_values=pixel_values,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        )
+        if KEY_LOGITS in out:
+            return out[KEY_LOGITS].argmax(dim=-1).tolist()
         return []
 
     # ------------------------------------------------------------------
@@ -246,41 +289,42 @@ class VQATrainer:
 
     def _save_checkpoint(self, epoch: int, metric: float) -> None:
         state = {
-            "epoch": epoch,
-            "global_step": self.global_step,
-            "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "metric": metric,
+            KEY_EPOCH: epoch,
+            KEY_GLOBAL_STEP: self.global_step,
+            KEY_MODEL_STATE: self.model.state_dict(),
+            KEY_OPTIM_STATE: self.optimizer.state_dict(),
+            KEY_BEST_VAL_METRIC: metric,
         }
         if self.scheduler is not None:
-            state["scheduler_state_dict"] = self.scheduler.state_dict()
+            state[KEY_SCHED_STATE] = self.scheduler.state_dict()
 
         path = self.output_dir / f"checkpoint_epoch_{epoch:03d}.pth"
         torch.save(state, path)
-        logger.info("Saved checkpoint: %s", path)
+        logger.info("Lưu checkpoint: %s", path)
 
+        # Cập nhật best model nếu metric cải thiện
         if metric > self.best_val_metric:
             self.best_val_metric = metric
             best_path = self.output_dir / "best_model.pth"
             torch.save(state, best_path)
-            logger.info("New best model saved (metric=%.4f)", metric)
+            logger.info("Best model mới được lưu (metric=%.4f)", metric)
 
     def load_checkpoint(self, checkpoint_path: str) -> int:
-        """Load a checkpoint and restore model / optimizer state.
+        """Tải checkpoint và khôi phục trạng thái model / optimizer.
 
         Args:
-            checkpoint_path: Path to a ``.pth`` checkpoint file.
+            checkpoint_path: Đường dẫn tới file checkpoint ``.pth``.
 
         Returns:
-            The epoch at which the checkpoint was saved.
+            Epoch tại thời điểm lưu checkpoint.
         """
         state = torch.load(checkpoint_path, map_location=self.device)
-        self.model.load_state_dict(state["model_state_dict"])
-        self.optimizer.load_state_dict(state["optimizer_state_dict"])
-        if self.scheduler is not None and "scheduler_state_dict" in state:
-            self.scheduler.load_state_dict(state["scheduler_state_dict"])
-        self.global_step = state.get("global_step", 0)
-        self.best_val_metric = state.get("metric", float("-inf"))
-        epoch = state.get("epoch", 0)
-        logger.info("Loaded checkpoint from %s (epoch %d)", checkpoint_path, epoch)
+        self.model.load_state_dict(state[KEY_MODEL_STATE])
+        self.optimizer.load_state_dict(state[KEY_OPTIM_STATE])
+        if self.scheduler is not None and KEY_SCHED_STATE in state:
+            self.scheduler.load_state_dict(state[KEY_SCHED_STATE])
+        self.global_step = state.get(KEY_GLOBAL_STEP, 0)
+        self.best_val_metric = state.get(KEY_BEST_VAL_METRIC, float("-inf"))
+        epoch = state.get(KEY_EPOCH, 0)
+        logger.info("Tải checkpoint từ %s (epoch %d)", checkpoint_path, epoch)
         return epoch
