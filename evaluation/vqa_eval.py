@@ -1,10 +1,10 @@
-"""VQA evaluation utilities.
+"""Tiện ích đánh giá mô hình VQA.
 
-Implements the official VQAv2 accuracy metric:
+Triển khai metric accuracy chính thức của VQAv2:
 
-    accuracy = min(#humans_who_gave_answer / 3, 1.0)
+    accuracy = min(số_người_chọn_đáp_án / 3, 1.0)
 
-for each question, averaged over the dataset.
+cho từng câu hỏi, sau đó lấy trung bình trên toàn bộ dataset.
 """
 
 from __future__ import annotations
@@ -14,16 +14,28 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
+from configs.contracts import (
+    KEY_ANSWER,
+    KEY_ANSWER_TYPE,
+    KEY_ANSWERS,
+    KEY_NUMBER_ACC,
+    KEY_OTHER_ACC,
+    KEY_OVERALL_ACC,
+    KEY_QUESTION_ID,
+    KEY_YESNO_ACC,
+    EvalResult,
+    PredictionRecord,
+)
 from data.vqa_dataset import normalize_answer
 
 
 class VQAEvaluator:
-    """Evaluate model predictions against VQAv2 ground-truth annotations.
+    """Đánh giá kết quả dự đoán của mô hình so với ground-truth VQAv2.
 
     Args:
-        annotation_file: Path to the VQAv2 annotations JSON.
-        question_file: Path to the VQAv2 questions JSON (optional; used to
-            populate per-question-type breakdowns).
+        annotation_file: Đường dẫn tới file JSON annotations của VQAv2.
+        question_file: Đường dẫn tới file JSON câu hỏi VQAv2 (tuỳ chọn;
+            dùng để phân tích theo từng loại câu hỏi).
     """
 
     def __init__(
@@ -34,64 +46,66 @@ class VQAEvaluator:
         with open(annotation_file, "r") as f:
             ann_data = json.load(f)
 
-        # Build question_id → annotation mapping
+        # Xây dựng mapping question_id → annotation
         self._annotations: Dict[int, Dict] = {
-            ann["question_id"]: ann for ann in ann_data["annotations"]
+            ann[KEY_QUESTION_ID]: ann for ann in ann_data["annotations"]
         }
 
-        # Optional question metadata
+        # Metadata câu hỏi (tuỳ chọn)
         self._question_types: Dict[int, str] = {}
         if question_file is not None and Path(question_file).exists():
             with open(question_file, "r") as f:
                 q_data = json.load(f)
             for q in q_data["questions"]:
-                self._question_types[q["question_id"]] = q.get("question_type", "")
+                self._question_types[q[KEY_QUESTION_ID]] = q.get("question_type", "")
 
     # ------------------------------------------------------------------
-    # Core metric
+    # Metric chính
     # ------------------------------------------------------------------
 
     def compute_accuracy(
         self,
-        predictions: List[Dict[str, Union[int, str]]],
-    ) -> Dict[str, float]:
-        """Compute VQA accuracy from a list of prediction dicts.
+        predictions: List[PredictionRecord],
+    ) -> EvalResult:
+        """Tính VQA accuracy từ danh sách các dự đoán.
 
         Args:
-            predictions: Each dict must contain:
+            predictions: Danh sách dict theo chuẩn :class:`configs.contracts.PredictionRecord`,
+                mỗi phần tử bao gồm:
                 * ``"question_id"`` (int)
-                * ``"answer"`` (str) – the predicted answer string.
+                * ``"answer"`` (str) – chuỗi câu trả lời dự đoán.
 
         Returns:
-            A dictionary with overall accuracy and per-type breakdowns::
+            Dict accuracy tổng thể và theo từng loại câu hỏi theo chuẩn
+            :class:`configs.contracts.EvalResult`::
 
                 {
-                    "overall": 0.6234,
-                    "yes/no": 0.8012,
-                    "number": 0.4321,
-                    "other": 0.5123,
+                    "overall": 62.34,
+                    "yes/no":  80.12,
+                    "number":  43.21,
+                    "other":   51.23,
                 }
         """
         if not predictions:
-            return {"overall": 0.0}
+            return {"overall": 0.0}  # type: ignore[return-value]
 
         type_correct: Dict[str, float] = defaultdict(float)
         type_total: Dict[str, int] = defaultdict(int)
         overall_correct = 0.0
 
         for pred in predictions:
-            qid = int(pred["question_id"])
-            predicted_answer = normalize_answer(str(pred["answer"]))
+            qid = int(pred[KEY_QUESTION_ID])
+            predicted_answer = normalize_answer(str(pred[KEY_ANSWER]))
 
             if qid not in self._annotations:
                 continue
 
             ann = self._annotations[qid]
-            answer_type = ann.get("answer_type", "other")
+            answer_type = ann.get(KEY_ANSWER_TYPE, "other")
 
-            # Count how many annotators gave the predicted answer
+            # Đếm số annotator đã chọn đúng đáp án dự đoán
             human_answers = [
-                normalize_answer(a["answer"]) for a in ann.get("answers", [])
+                normalize_answer(a[KEY_ANSWER]) for a in ann.get(KEY_ANSWERS, [])
             ]
             acc = min(human_answers.count(predicted_answer) / 3.0, 1.0)
 
@@ -100,29 +114,35 @@ class VQAEvaluator:
             type_total[answer_type] += 1
 
         overall = overall_correct / len(predictions)
-        results: Dict[str, float] = {"overall": round(overall * 100, 2)}
+        results: Dict[str, float] = {KEY_OVERALL_ACC: round(overall * 100, 2)}
 
         for ans_type, total in type_total.items():
             if total > 0:
-                results[ans_type] = round(type_correct[ans_type] / total * 100, 2)
+                # Dùng key constant tương ứng với từng loại câu hỏi
+                if ans_type == "yes/no":
+                    results[KEY_YESNO_ACC] = round(type_correct[ans_type] / total * 100, 2)
+                elif ans_type == "number":
+                    results[KEY_NUMBER_ACC] = round(type_correct[ans_type] / total * 100, 2)
+                else:
+                    results[KEY_OTHER_ACC] = round(type_correct[ans_type] / total * 100, 2)
 
-        return results
+        return results  # type: ignore[return-value]
 
     # ------------------------------------------------------------------
-    # Convenience
+    # Tiện ích
     # ------------------------------------------------------------------
 
-    def evaluate_from_file(self, result_file: str) -> Dict[str, float]:
-        """Load predictions from a JSON file and evaluate.
+    def evaluate_from_file(self, result_file: str) -> EvalResult:
+        """Tải dự đoán từ file JSON và thực hiện đánh giá.
 
-        The file must be a JSON array of objects with ``"question_id"`` and
-        ``"answer"`` keys (standard VQA result format).
+        File phải là một mảng JSON gồm các object có khoá ``"question_id"``
+        và ``"answer"`` (định dạng chuẩn VQA result).
 
         Args:
-            result_file: Path to the predictions JSON file.
+            result_file: Đường dẫn tới file JSON chứa dự đoán.
 
         Returns:
-            Accuracy dict; see :meth:`compute_accuracy`.
+            Dict accuracy; xem :meth:`compute_accuracy`.
         """
         with open(result_file, "r") as f:
             predictions = json.load(f)
@@ -134,18 +154,18 @@ class VQAEvaluator:
         answers: List[str],
         output_file: str,
     ) -> None:
-        """Serialize predictions to a VQA-format JSON file.
+        """Lưu dự đoán ra file JSON theo định dạng chuẩn VQA.
 
         Args:
-            question_ids: List of question ids.
-            answers: Corresponding predicted answer strings.
-            output_file: Destination path.
+            question_ids: Danh sách question id.
+            answers: Chuỗi câu trả lời tương ứng với mỗi question id.
+            output_file: Đường dẫn file đầu ra.
         """
         if len(question_ids) != len(answers):
-            raise ValueError("question_ids and answers must have the same length.")
+            raise ValueError("question_ids và answers phải có cùng độ dài.")
 
         results = [
-            {"question_id": int(qid), "answer": str(ans)}
+            {KEY_QUESTION_ID: int(qid), KEY_ANSWER: str(ans)}
             for qid, ans in zip(question_ids, answers)
         ]
         Path(output_file).parent.mkdir(parents=True, exist_ok=True)
@@ -153,19 +173,19 @@ class VQAEvaluator:
             json.dump(results, f, indent=2)
 
     # ------------------------------------------------------------------
-    # Per-sample scoring (used during training for soft metrics)
+    # Tính điểm từng mẫu (dùng trong training để tính soft metric)
     # ------------------------------------------------------------------
 
     @staticmethod
     def score_answer(predicted: str, human_answers: List[str]) -> float:
-        """Compute VQA accuracy for a single prediction.
+        """Tính VQA accuracy cho một dự đoán đơn lẻ.
 
         Args:
-            predicted: The model's predicted answer string.
-            human_answers: List of human annotator answers (up to 10).
+            predicted: Câu trả lời dự đoán của mô hình.
+            human_answers: Danh sách câu trả lời của annotator (tối đa 10).
 
         Returns:
-            Float in ``[0, 1]``.
+            Giá trị float trong khoảng ``[0, 1]``.
         """
         pred_norm = normalize_answer(predicted)
         human_norms = [normalize_answer(a) for a in human_answers]
