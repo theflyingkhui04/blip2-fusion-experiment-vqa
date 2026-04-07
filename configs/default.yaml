@@ -1,8 +1,9 @@
 model:
   name: blip2_vqa                    # blip2_vqa | concat_fusion | bilinear_fusion | attention_fusion | mlb_fusion
+                                     # | mfb_fusion | cross_attn_fusion | qformer_scratch | perceiver_resampler
   blip2_model_name: Salesforce/blip2-opt-2.7b
   num_query_tokens: 32
-  vision_width: 1408
+  vision_width: 1024                 # ViT-L/14 (CLIP) output dim — matches pre_extract_features.py cache
   hidden_size: 768
   num_layers: 12
   num_heads: 12

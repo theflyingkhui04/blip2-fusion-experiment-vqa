@@ -250,8 +250,14 @@ class CheckpointDict(TypedDict, total=False):
 class ModelConfig(TypedDict, total=False):
     """``cfg["model"]`` block in default.yaml."""
 
-    name:               str    # "blip2_vqa" | "concat_fusion" | "bilinear_fusion"
-                               # | "attention_fusion" | "mlb_fusion"
+    name:               str    # "blip2_vqa"
+                               # | "mean_linear"        (EXP-01)
+                               # | "concat_fusion"       (EXP-02)
+                               # | "mlb_fusion"          (EXP-03)
+                               # | "mfb_fusion"          (EXP-04)
+                               # | "cross_attn_fusion"   (EXP-05)
+                               # | "qformer_scratch"     (EXP-06)
+                               # | "perceiver_resampler" (EXP-07)
     blip2_model_name:   str    # HuggingFace model id, e.g. "Salesforce/blip2-opt-2.7b"
     num_query_tokens:   int    # Q-Former query token count (default 32)
     vision_width:       int    # ViT output dim (default 1408 for EVA-CLIP ViT-g)
@@ -388,7 +394,7 @@ IMAGE_SIZE: int = 224
 # Q-Former defaults (must match QFormerConfig defaults)
 NUM_QUERY_TOKENS: int = 32
 QFORMER_HIDDEN_SIZE: int = 768
-VISION_ENCODER_WIDTH: int = 1408   # EVA-CLIP ViT-g/14
+VISION_ENCODER_WIDTH: int = 1024   # CLIP ViT-L/14 — must match pre_extract_features.py cache
 
 # CLIP ViT-L/14 feature dimensions (used by pre_extract_features.py)
 CLIP_FEATURE_DIM: int = 1024    # ViT-L/14 output channel dimension
@@ -407,18 +413,29 @@ VQA_SCORE_DENOMINATOR: int = 3     # min(count / 3, 1.0)
 LABEL_IGNORE_INDEX: int = -100
 
 # Model name keys (must match ModelConfig.name values and fusion registry keys)
-MODEL_BLIP2_VQA:      str = "blip2_vqa"
-MODEL_CONCAT_FUSION:  str = "concat_fusion"
-MODEL_BILINEAR_FUSION: str = "bilinear_fusion"
-MODEL_ATTENTION_FUSION: str = "attention_fusion"
-MODEL_MLB_FUSION:     str = "mlb_fusion"
+MODEL_BLIP2_VQA:           str = "blip2_vqa"
+MODEL_MEAN_LINEAR:          str = "mean_linear"          # EXP-01
+MODEL_CONCAT_FUSION:        str = "concat_fusion"         # EXP-02
+MODEL_MLB_FUSION:           str = "mlb_fusion"            # EXP-03
+MODEL_MFB_FUSION:           str = "mfb_fusion"            # EXP-04
+MODEL_CROSS_ATTN_FUSION:    str = "cross_attn_fusion"     # EXP-05
+MODEL_QFORMER_SCRATCH:      str = "qformer_scratch"       # EXP-06
+MODEL_PERCEIVER_RESAMPLER:  str = "perceiver_resampler"   # EXP-07
+# (giữ lại để tương thích ngược)
+MODEL_BILINEAR_FUSION:      str = "bilinear_fusion"
+MODEL_ATTENTION_FUSION:     str = "attention_fusion"
 
 VALID_MODEL_NAMES = frozenset({
     MODEL_BLIP2_VQA,
+    MODEL_MEAN_LINEAR,
     MODEL_CONCAT_FUSION,
+    MODEL_MLB_FUSION,
+    MODEL_MFB_FUSION,
+    MODEL_CROSS_ATTN_FUSION,
+    MODEL_QFORMER_SCRATCH,
+    MODEL_PERCEIVER_RESAMPLER,
     MODEL_BILINEAR_FUSION,
     MODEL_ATTENTION_FUSION,
-    MODEL_MLB_FUSION,
 })
 
 # Operating modes for BLIP2VQA
