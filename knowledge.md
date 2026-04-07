@@ -1,40 +1,554 @@
-# BLIP-2 & VQAv2 — Toàn bộ kiến thức
+# BLIP-2 & VQAv2 — Kiến thức nền cho thí nghiệm Multimodal Fusion
 
 ---
 
 ## MỤC LỤC
 
-1. [BLIP-2 Overview](#1-blip-2-overview)
-2. [Kiến trúc BLIP-2](#2-kiến-trúc-blip-2)
-3. [Q-Former — Trái tim của BLIP-2](#3-q-former--trái-tim-của-blip-2)
-4. [Hai giai đoạn huấn luyện](#4-hai-giai-đoạn-huấn-luyện)
-5. [Các mục tiêu học (Pre-training Objectives)](#5-các-mục-tiêu-học-pre-training-objectives)
-6. [Inference & Zero-shot Generalization](#6-inference--zero-shot-generalization)
-7. [So sánh BLIP-2 với các mô hình khác](#7-so-sánh-blip-2-với-các-mô-hình-khác)
-8. [Dataset VQAv2](#8-dataset-vqav2)
-9. [Evaluation trên VQAv2](#9-evaluation-trên-vqav2)
-10. [Ablation Study Q-Former](#10-ablation-study-q-former)
-11. [Hạn chế & Hướng phát triển](#11-hạn-chế--hướng-phát-triển)
-12. [Tóm tắt nhanh (Cheat Sheet)](#12-tóm-tắt-nhanh-cheat-sheet)
+1. [Tổng quan dự án](#1-tổng-quan-dự-án)
+2. [Vision Encoder — CLIP ViT-L/14](#2-vision-encoder--clip-vit-l14)
+3. [Text Encoder — BERT-base](#3-text-encoder--bert-base)
+4. [BLIP-2 & Q-Former](#4-blip-2--q-former)
+5. [Các phương pháp Fusion](#5-các-phương-pháp-fusion)
+   - [EXP-01: Mean Pooling + Linear](#51-exp-01-mean-pooling--linear)
+   - [EXP-02: Concat + MLP](#52-exp-02-concat--mlp)
+   - [EXP-03: MLB — Multi-modal Low-rank Bilinear](#53-exp-03-mlb--multi-modal-low-rank-bilinear)
+   - [EXP-04: MFB — Multi-modal Factorized Bilinear](#54-exp-04-mfb--multi-modal-factorized-bilinear)
+   - [EXP-05: Query Cross-Attention Bridge](#55-exp-05-query-cross-attention-bridge)
+   - [EXP-06: Q-Former from Scratch](#56-exp-06-q-former-from-scratch)
+   - [EXP-07: Perceiver Resampler](#57-exp-07-perceiver-resampler)
+6. [So sánh các phương pháp](#6-so-sánh-các-phương-pháp)
+7. [Dataset VQAv2](#7-dataset-vqav2)
+8. [Evaluation trên VQAv2](#8-evaluation-trên-vqav2)
+9. [Tóm tắt nhanh (Cheat Sheet)](#9-tóm-tắt-nhanh-cheat-sheet)
 
 ---
 
-## 1. BLIP-2 Overview
+## 1. Tổng quan dự án
 
-### 1.1 Bối cảnh
+Dự án này so sánh **7 chiến lược fusion đa phương thức** cho bài toán VQA (Visual Question Answering) trên dataset VQAv2. Tất cả các thí nghiệm dùng chung:
 
-**BLIP-2** (Bootstrapping Language-Image Pre-training 2) được Salesforce Research công bố năm 2023 (Li et al., ICML 2023). Đây là bước tiến hóa từ BLIP gốc (2022), với mục tiêu chính:
+- **Vision features** trích xuất từ CLIP ViT-L/14 (frozen)
+- **Text features** từ BERT-base (frozen)
+- **Bộ phân loại** trên 3.129 câu trả lời cố định
 
-- **Kết nối hiệu quả** frozen Image Encoder (vision) với frozen LLM (language) mà **không cần fine-tune cả hai**.
-- Giảm chi phí tính toán trong khi vẫn đạt SOTA trên nhiều vision-language task.
-- Giải quyết bài toán **modality gap** — khoảng cách biểu diễn giữa vision và language.
+Cấu trúc chung của pipeline:
 
-### 1.2 Ý tưởng cốt lõi
+```
+Ảnh  → [CLIP ViT-L/14 frozen] → visual tokens [B, 257, 1024]
+                                        │
+                                  [Fusion Module]  ← text [B, 768]
+                                        │
+                              [Classifier MLP] → logits [B, 3129]
+```
 
-> "Instead of end-to-end training, use a lightweight trainable module (Q-Former) to bridge the frozen vision encoder and the frozen LLM."
+Mục tiêu: tìm hiểu xem module fusion nào khai thác tốt nhất thông tin visual và textual, từ cách tiếp cận đơn giản nhất (pooling + linear) đến phức tạp nhất (Q-Former, Perceiver Resampler).
 
-Thay vì train toàn bộ mô hình (tốn kém), BLIP-2 **đóng băng (freeze)** cả:
-- Image Encoder (ViT-L/14 từ CLIP hoặc EVA-CLIP ViT-g/14)
+---
+
+## 2. Vision Encoder — CLIP ViT-L/14
+
+### 2.1 Tổng quan
+
+**CLIP** (Contrastive Language-Image Pre-training, Radford et al. 2021) được pre-train trên 400M cặp ảnh-text bằng contrastive learning. Vision encoder của CLIP là **ViT-L/14** (Vision Transformer Large, patch size 14).
+
+### 2.2 Thông số kỹ thuật
+
+| Thông số | Giá trị |
+|---|---|
+| Kiến trúc | Vision Transformer (ViT) |
+| Kích thước patch | 14×14 px |
+| Ảnh đầu vào | 224×224 px |
+| Số patch token | 256 (= 16×16 patches) |
+| CLS token | 1 |
+| Tổng token output | **257** (1 CLS + 256 patch) |
+| Chiều output | **1024** |
+| Số params | ~307M |
+| Trạng thái | **Đóng băng hoàn toàn** trong tất cả thí nghiệm |
+
+### 2.3 Cách sử dụng trong dự án
+
+```
+Input:  ảnh RGB [B, 3, 224, 224]
+Output: [B, 257, 1024]  — toàn bộ patch tokens (dùng cho EXP-05, 06, 07)
+        [B, 1024]       — CLS token hoặc mean pool (dùng cho EXP-01 đến 04)
+```
+
+**Pre-extraction**: Do ViT-L/14 là frozen, features được trích xuất trước và lưu vào HDF5 cache để tránh chạy lại mỗi epoch:
+- Cache CLS-only: ~0.24 GB (EXP-01 đến 04)
+- Cache full patch: ~63 GB (EXP-05 đến 07, hoặc chạy on-the-fly)
+
+### 2.4 Lý do chọn ViT-L/14
+
+- Được dùng trong paper BLIP-2 gốc làm một trong hai lựa chọn encoder
+- Cân bằng giữa hiệu năng và chi phí tính toán (nhẹ hơn EVA-CLIP ViT-g/14)
+- SDK CLIP của HuggingFace đơn giản, ổn định
+
+---
+
+## 3. Text Encoder — BERT-base
+
+### 3.1 Tổng quan
+
+**BERT** (Bidirectional Encoder Representations from Transformers, Devlin et al. 2019) là mô hình ngôn ngữ bidirectional được pre-train trên BookCorpus + Wikipedia.
+
+### 3.2 Thông số kỹ thuật
+
+| Thông số | Giá trị |
+|---|---|
+| Kiến trúc | Transformer Encoder |
+| Số lớp | 12 |
+| Hidden dim | 768 |
+| Attention heads | 12 |
+| Vocab size | 30,522 |
+| Số params | ~110M |
+| Độ dài tối đa | 512 token |
+| Trạng thái | **Đóng băng** (chỉ lấy CLS token embedding) |
+
+### 3.3 Cách sử dụng
+
+```
+Input:  câu hỏi đã tokenize [B, 50]  (max_question_length = 50)
+Output: CLS token [B, 768]  — đại diện toàn bộ câu hỏi
+```
+
+Tất cả 7 thí nghiệm dùng CLS token của BERT làm text representation.
+
+---
+
+## 4. BLIP-2 & Q-Former
+
+### 4.1 BLIP-2 là gì
+
+**BLIP-2** (Bootstrapping Language-Image Pre-training 2, Li et al. ICML 2023) đề xuất dùng một module nhỏ trainable gọi là **Q-Former** để kết nối frozen Vision Encoder với frozen LLM, thay vì fine-tune toàn bộ.
+
+```
+[Frozen ViT] → Image patches
+                     ↓
+               [Q-Former] ← Text / Instructions
+                     ↓
+           32 Query token outputs (768-dim)
+                     ↓
+             [Linear Projection]
+                     ↓
+              [Frozen LLM (OPT / FlanT5)]
+```
+
+### 4.2 Q-Former — Kiến trúc chi tiết
+
+Q-Former dựa trên BERT-base (12 lớp, 768 hidden, 12 heads) với **32 learnable query token** được thêm vào.
+
+```
+Learnable queries: [B, 32, 768]
+Visual patches:    [B, 257, 1024] → proj → [B, 257, 768]
+
+Mỗi QFormerLayer:
+  - Self-attention: queries attend to queries
+  - Cross-attention: queries attend to visual patches  ← chỉ ở lớp chẵn (0, 2, 4, ...)
+  - Feed-forward network
+
+Output: [B, 32, 768]  — 32 visual query representations
+```
+
+**Cross-attention frequency**: Cứ 2 lớp 1 lần (lớp chẵn) mới có cross-attention với visual patches. Lớp lẻ chỉ có self-attention → tiết kiệm tính toán.
+
+### 4.3 Vai trò trong dự án
+
+Q-Former xuất hiện ở **hai dạng** trong bộ thí nghiệm:
+
+| | EXP-06 (Q-Former scratch) | EXP-05 (Cross-Attn Bridge) |
+|---|---|---|
+| Số lớp | 12 | 3 |
+| Cross-attn freq | 2 | 1 (mỗi lớp) |
+| Query tokens | 32 | 32 |
+| Params | ~190M | ~22M |
+| Khởi tạo | Random | Random |
+
+EXP-06 là triển khai đầy đủ Q-Former theo paper BLIP-2. EXP-05 là phiên bản đơn giản hóa.
+
+### 4.4 Kết quả BLIP-2 trên VQAv2 (tham khảo)
+
+| Model | Test-dev (zero-shot) |
+|---|---|
+| BLIP-2 ViT-L/14 + FlanT5-XL | 62.3% |
+| BLIP-2 EVA-CLIP + FlanT5-XXL | 65.0% |
+| BLIP-2 FlanT5-XXL (finetuned) | ~82% |
+
+---
+
+## 5. Các phương pháp Fusion
+
+### 5.1 EXP-01: Mean Pooling + Linear
+
+**Ý tưởng**: Đơn giản nhất có thể — gộp visual patch tokens bằng mean, ghép với text CLS, rồi dùng một lớp linear dự đoán câu trả lời.
+
+**Luồng xử lý**:
+```
+visual: [B, 257, 1024] → mean(dim=1) → [B, 1024]
+text:   [B, 768]
+concat: [B, 1792] → Linear(1792, 3129) → logits
+```
+
+**Điểm mạnh**: Cực kỳ nhanh, dễ debug, là điểm mốc so sánh tuyệt đối.
+
+**Điểm yếu**: Không có phi tuyến → khả năng biểu diễn thấp. Mean pooling mất thông tin không gian.
+
+**Tham số trainable**: ~5.7M
+
+---
+
+### 5.2 EXP-02: Concat + MLP
+
+**Paper tham khảo**: Antol et al., *VQA: Visual Question Answering*, ICCV 2015 (baseline gốc của VQA).
+
+**Ý tưởng**: Thêm phi tuyến (ReLU + Dropout) vào EXP-01. MLP học được biểu diễn tốt hơn linear thuần.
+
+**Luồng xử lý**:
+```
+visual: [B, 257, 1024] → mean(dim=1) → [B, 1024]
+text:   [B, 768]
+concat: [B, 1792]
+  → Linear(1792, 1024) → ReLU → Dropout(0.1)
+  → Linear(1024, 3129) → logits
+```
+
+**Điểm mạnh**: Đơn giản, ổn định, là baseline mạnh hơn EXP-01.
+
+**Điểm yếu**: Vẫn mất thông tin không gian (dùng mean pool). Fusion chỉ là additive/concat, không bắt được tương tác nhân giữa hai modaliti.
+
+**Tham số trainable**: ~7.2M
+
+---
+
+### 5.3 EXP-03: MLB — Multi-modal Low-rank Bilinear
+
+**Paper**: Kim et al., *Hadamard Product for Low-rank Bilinear Pooling*, ICLR 2017.
+
+**Ý tưởng cốt lõi**: Bilinear pooling đầy đủ $f = v^T W t$ có $O(d_v \times d_t \times d_{out})$ tham số — quá lớn. MLB xấp xỉ bằng cách chiếu cả hai về cùng chiều rồi dùng **tích Hadamard** (element-wise product):
+
+$$f = \tanh(W_v v) \odot \tanh(W_t t)$$
+
+**Luồng xử lý**:
+```
+visual: [B, 1024] → Linear(1024, 2048) → tanh → Dropout → [B, 2048]
+text:   [B, 768]  → Linear(768,  2048) → tanh → Dropout → [B, 2048]
+fused:  v ⊙ t                                            → [B, 2048]
+  → Linear(2048, 1024) → ReLU → Dropout
+  → Linear(1024, 3129) → logits
+```
+
+**Tại sao Hadamard tốt hơn concat?** Tích element-wise mô hình hóa tương tác **nhân** giữa từng chiều của visual và text — bắt được cross-modal correlation mà concat bỏ qua.
+
+**Điểm yếu**: Chỉ có **một bậc** bilinear interaction, có thể chưa đủ phức tạp.
+
+**Tham số trainable**: ~10.5M
+
+---
+
+### 5.4 EXP-04: MFB — Multi-modal Factorized Bilinear
+
+**Paper**: Zhou et al., *MFB and Co-Attention for Visual Question Answering*, ICCV 2017.
+
+**Ý tưởng cốt lõi**: Thay vì dùng 1 Hadamard product (MLB), MFB dùng **k=5 nhân tố song song** rồi **sum-pool** kết quả và **L2-normalize**:
+
+$$f = \text{L2-norm}\left(\sum_{i=1}^{k} \tanh(W_v^{(i)} v) \odot \tanh(W_t^{(i)} t)\right)$$
+
+**Luồng xử lý**:
+```
+visual: [B, 1024] → Linear(1024, 5120) → [B, 5120]
+text:   [B, 768]  → Linear(768,  5120) → [B, 5120]
+fused:  v ⊙ t                          → [B, 5120]
+reshape: [B, 5, 1024]
+sum over k=5: [B, 1024]
+L2-norm: [B, 1024]
+  → Linear(1024, 1024) → ReLU → Dropout
+  → Linear(1024, 3129) → logits
+```
+
+**MFB vs MLB**:
+
+| | MLB | MFB |
+|---|---|---|
+| Số nhân tố | 1 | k=5 |
+| Normalization | Không | L2-norm sau sum-pool |
+| Biểu diễn | Kém phong phú hơn | Phong phú hơn |
+| Params | ~10.5M | ~17M |
+
+**L2-norm sau sum-pool**: Giúp ổn định training và tránh gradient vanishing.
+
+**Tham số trainable**: ~17M
+
+---
+
+### 5.5 EXP-05: Query Cross-Attention Bridge
+
+**Ý tưởng**: Thay vì pool visual patches thành một vector rồi fusion, dùng **learnable query tokens** attend trực tiếp vào toàn bộ patch sequence. Câu hỏi không guide attention một cách tường minh — queries tự học cách trích xuất thông tin visual quan trọng.
+
+**Luồng xử lý**:
+```
+queries:  [1, 32, 768] → expand → [B, 32, 768]
+visual:   [B, 257, 1024] → Linear(1024, 768) → [B, 257, 768]
+
+Lặp 3 lần (3 lớp cross-attention):
+  queries = LayerNorm(queries)
+  queries = queries + MultiHeadCrossAttn(Q=queries, K=visual, V=visual, heads=8)
+  queries = queries + FFN(LayerNorm(queries))
+
+pooled = queries.mean(dim=1) → [B, 768]
+fused  = concat(pooled, text_cls) → [B, 1536]
+  → MLP(1536, 1024, 3129) → logits
+```
+
+**Tại sao chỉ 3 lớp?** Đây là phiên bản rút gọn của Q-Former — đủ để học spatial attention mà không quá tốn tài nguyên.
+
+**Điểm mạnh**: Giữ được thông tin không gian từ patch tokens. Queries có thể focus vào các vùng ảnh khác nhau.
+
+**Điểm yếu**: Text chưa guide visual attention — text chỉ được ghép lại sau khi attend.
+
+**Tham số trainable**: ~22M
+
+---
+
+### 5.6 EXP-06: Q-Former from Scratch
+
+**Paper**: Li et al., *BLIP-2: Bootstrapping Language-Image Pre-training with Frozen Image Encoders and Large Language Models*, ICML 2023.
+
+**Ý tưởng**: Triển khai đầy đủ Q-Former như paper BLIP-2 mô tả, train từ đầu (không load pretrained weights). Đây là "chuẩn vàng" của bộ thí nghiệm.
+
+**Luồng xử lý** (xem `models/qformer.py`):
+```
+queries:  [1, 32, 768] → expand → [B, 32, 768]
+visual:   [B, 257, 1024] → visual_proj → visual_norm → [B, 257, 768]
+
+12 khối QFormerLayer:
+  Lớp chẵn (0, 2, 4, ..., 10):
+    queries → self-attn(queries, queries) → cross-attn(queries, visual) → FFN
+  Lớp lẻ  (1, 3, 5, ..., 11):
+    queries → self-attn(queries, queries) → FFN
+
+output: [B, 32, 768] → mean(dim=1) → [B, 768]
+fused:  concat([B, 768], text_cls[B, 768]) → [B, 1536]
+  → MLP(1536, 1024, 3129) → logits
+```
+
+**Cross-attention frequency = 2**: Lớp chẵn có cross-attention với visual, lớp lẻ không — giúp giảm tính toán mà vẫn đủ visual grounding.
+
+**Tại sao "from scratch"?** Trong project này không load pretrained BLIP-2 weights (quá nặng). Ta train Q-Former từ random init trực tiếp trên VQAv2 — kết quả sẽ thấp hơn pretrained nhưng cho thấy khả năng học của kiến trúc.
+
+**Tham số trainable**: ~190M
+
+---
+
+### 5.7 EXP-07: Perceiver Resampler
+
+**Paper**: Alayrac et al., *Flamingo: a Visual Language Model for Few-Shot Learning*, NeurIPS 2022.
+
+**Ý tưởng**: Thay vì dùng BERT-style transformer như Q-Former, Flamingo dùng **Perceiver Resampler** — kiến trúc đơn giản hơn: latent queries attend vào visual patches qua cross-attention, với visual patches làm **context** (không phải key/value riêng).
+
+**Điểm khác biệt quan trọng so với Q-Former**:
+
+| | Q-Former (EXP-06) | Perceiver Resampler (EXP-07) |
+|---|---|---|
+| Self-attention giữa queries | ✓ | ✓ |
+| Cross-attn với visual | Ở lớp chẵn | Ở **mỗi** lớp |
+| Queries làm K/V trong cross-attn | ✗ | ✓ (concat queries + visual làm K/V) |
+| Số lớp | 12 | 4 |
+| Query count | 32 | 64 |
+| Text interaction | Không tường minh | Không tường minh |
+| Pre-training objectives | ITC + ITM + ITG (trong BLIP-2) | Chỉ generative (trong Flamingo) |
+
+**Luồng xử lý**:
+```
+latents: [1, 64, 768] → expand → [B, 64, 768]
+visual:  [B, 257, 1024] → Linear(1024, 768) → [B, 257, 768]
+
+Lặp 4 lần (4 lớp Perceiver):
+  latents = LayerNorm(latents)
+  context = concat(latents, visual) → [B, 64+257, 768]   ← latents + visual làm K/V
+  latents = latents + MultiHeadCrossAttn(Q=latents, K=context, V=context)
+  latents = latents + FFN(LayerNorm(latents))
+
+pooled = latents.mean(dim=1) → [B, 768]
+fused  = concat(pooled, text_cls) → [B, 1536]
+  → MLP(1536, 1024, 3129) → logits
+```
+
+**Tại sao concat latents + visual làm K/V?** Cho phép latent queries attend cả vào nhau **và** vào visual patches trong một phép cross-attention — tiết kiệm tính toán hơn so với tách thành self-attention riêng + cross-attention riêng.
+
+**Tham số trainable**: ~58M
+
+---
+
+## 6. So sánh các phương pháp
+
+### 6.1 Theo loại visual input
+
+| | Pooled vector [B, 1024] | Patch sequence [B, 257, 1024] |
+|---|---|---|
+| EXP-01 Mean+Linear | ✓ | |
+| EXP-02 Concat+MLP | ✓ | |
+| EXP-03 MLB | ✓ | |
+| EXP-04 MFB | ✓ | |
+| EXP-05 Cross-Attn | | ✓ |
+| EXP-06 Q-Former | | ✓ |
+| EXP-07 Perceiver | | ✓ |
+
+EXP-01 đến 04 **mất thông tin không gian** vì dùng pooled vector. EXP-05 đến 07 giữ nguyên toàn bộ 257 patch tokens.
+
+### 6.2 Theo loại fusion
+
+| | Additive/Concat | Bilinear (Hadamard) | Cross-attention |
+|---|---|---|---|
+| EXP-01 | ✓ | | |
+| EXP-02 | ✓ | | |
+| EXP-03 MLB | | ✓ | |
+| EXP-04 MFB | | ✓ (k-factor) | |
+| EXP-05 | ✓ (cuối) | | ✓ (visual) |
+| EXP-06 Q-Former | ✓ (cuối) | | ✓ (visual) |
+| EXP-07 Perceiver | ✓ (cuối) | | ✓ (visual) |
+
+### 6.3 Độ phức tạp tăng dần
+
+```
+EXP-01 (5.7M)  →  EXP-02 (7.2M)  →  EXP-03 (10.5M)  →  EXP-04 (17M)
+     ↑ pooled features, tăng dần bilinear interaction
+
+EXP-05 (22M)  →  EXP-07 (58M)  →  EXP-06 (190M)
+     ↑ patch-level, tăng dần độ sâu transformer
+```
+
+### 6.4 Giả thuyết kết quả kỳ vọng
+
+- EXP-01 < EXP-02 : Phi tuyến giúp ích
+- EXP-02 < EXP-03 < EXP-04 : Bilinear tốt hơn concat; MFB tốt hơn MLB
+- EXP-04 < EXP-05 : Patch-level attention tốt hơn pooled features
+- EXP-05 < EXP-07 ≈ EXP-06 : Perceiver tương đương Q-Former với ít params hơn
+
+---
+
+## 7. Dataset VQAv2
+
+### 7.1 Tổng quan
+
+**VQAv2** (Goyal et al., CVPR 2017) khắc phục language bias của VQA v1 bằng **complementary image pairs** — mỗi câu hỏi có 2 ảnh với câu trả lời ngược nhau, buộc mô hình phải thực sự "nhìn" ảnh.
+
+### 7.2 Thống kê
+
+| Thống kê | Giá trị |
+|---|---|
+| Tổng QA pairs | ~1.1 triệu |
+| Ảnh nguồn | MS-COCO 2014 (~123K ảnh) |
+| Annotators/câu hỏi | 10 người |
+| **Train** | 443.757 QA pairs · 82.783 ảnh |
+| **Validation** | 214.354 QA pairs · 40.504 ảnh |
+| **Test-dev** | 107.394 QA pairs |
+| Bộ từ vựng câu trả lời | 3.129 (top answers) |
+
+### 7.3 Phân loại câu hỏi
+
+| Loại | Tỉ lệ | Ví dụ |
+|---|---|---|
+| Yes/No | ~38% | "Is there a dog in this image?" |
+| Number | ~12% | "How many people are there?" |
+| Other | ~50% | "What color is the car?" |
+
+### 7.4 Soft Answer Scoring
+
+Mỗi câu hỏi có **10 câu trả lời** từ 10 annotators. Thay vì one-hot label, dùng **soft score**:
+
+```
+score(a) = min(1.0, count(a trong 10 answers) / 3)
+```
+
+Ví dụ: 3 người trả lời "yes" → score = 1.0; 1 người → score = 0.33.
+
+Loss function sử dụng **soft-target BCE** trên 3.129 classes với các soft score này.
+
+---
+
+## 8. Evaluation trên VQAv2
+
+### 8.1 VQA Accuracy
+
+Metric chính:
+
+$$\text{Acc}(a, A) = \min\!\left(1,\ \frac{\text{count}(a \in A)}{3}\right)$$
+
+$$\text{Overall} = \frac{1}{N} \sum_{i=1}^{N} \text{Acc}(a_i, A_i)$$
+
+Trong đó $A$ là tập 10 câu trả lời của annotators, $a$ là câu trả lời dự đoán.
+
+### 8.2 Báo cáo kết quả
+
+Thường báo cáo overall + breakdown theo loại:
+
+| Metric | Mô tả |
+|---|---|
+| `overall` | Trung bình toàn bộ |
+| `yes/no` | Chỉ câu hỏi Yes/No (~38%) |
+| `number` | Chỉ câu hỏi Number (~12%) |
+| `other` | Còn lại (~50%) |
+
+### 8.3 Kết quả tham chiếu
+
+| Model | VQAv2 val (accuracy) |
+|---|---|
+| Random baseline | ~25% |
+| Language-only (no image) | ~50% |
+| Simple CNN + LSTM (VQA v1 baseline) | ~58% |
+| MLB (Kim et al. 2017) | ~65% |
+| MFB (Zhou et al. 2017) | ~66% |
+| BLIP-2 ViT-L/14 + FlanT5-XL (zero-shot) | ~62% |
+| BLIP-2 EVA-CLIP + FlanT5-XXL (finetuned) | ~82% |
+
+---
+
+## 9. Tóm tắt nhanh (Cheat Sheet)
+
+### Các chiều tensor quan trọng
+
+```
+ViT-L/14 output:      [B, 257, 1024]   (257 = 1 CLS + 256 patches)
+BERT-base CLS:        [B, 768]
+Q-Former query out:   [B, 32, 768]
+Perceiver latent out: [B, 64, 768]
+Answer logits:        [B, 3129]
+```
+
+### Công thức VQA Accuracy
+
+$$\text{Acc}(a, A) = \min\!\left(1,\ \frac{\text{count}(a \in A)}{3}\right)$$
+
+### Loss function (tất cả thí nghiệm)
+
+$$\mathcal{L} = -\sum_{c=1}^{3129} s_c \cdot \log \sigma(\hat{y}_c) + (1 - s_c) \cdot \log(1 - \sigma(\hat{y}_c))$$
+
+Trong đó $s_c$ là soft score của answer $c$, $\hat{y}_c$ là logit tương ứng.
+
+### Tham số trainable theo thí nghiệm
+
+| Thí nghiệm | Params |
+|---|---|
+| EXP-01 Mean Pool + Linear | ~5.7M |
+| EXP-02 Concat + MLP | ~7.2M |
+| EXP-03 MLB | ~10.5M |
+| EXP-04 MFB | ~17M |
+| EXP-05 Cross-Attn Bridge | ~22M |
+| EXP-07 Perceiver Resampler | ~58M |
+| EXP-06 Q-Former from Scratch | ~190M |
+
+### Tài liệu tham khảo chính
+
+1. **BLIP-2**: Li et al., *BLIP-2: Bootstrapping Language-Image Pre-training with Frozen Image Encoders and Large Language Models*, ICML 2023.
+2. **VQAv2**: Goyal et al., *Making the V in VQA Matter*, CVPR 2017.
+3. **MLB**: Kim et al., *Hadamard Product for Low-rank Bilinear Pooling*, ICLR 2017.
+4. **MFB**: Zhou et al., *MFB and Co-Attention for Visual Question Answering*, ICCV 2017.
+5. **Flamingo / Perceiver**: Alayrac et al., *Flamingo: a Visual Language Model for Few-Shot Learning*, NeurIPS 2022.
+6. **CLIP**: Radford et al., *Learning Transferable Visual Models From Natural Language Supervision*, ICML 2021.
+7. **BERT**: Devlin et al., *BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding*, NAACL 2019.
+
+---
+
+*File knowledge.md — cập nhật theo bộ thí nghiệm 7 fusion baselines.*
 - Large Language Model (OPT hoặc FlanT5)
 
 Và chỉ **train một module nhỏ** gọi là **Q-Former** (~188M params) làm cầu nối.
