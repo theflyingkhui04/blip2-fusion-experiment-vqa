@@ -76,8 +76,11 @@ blip2-fusion-experiment-vqa/
 │   └── evaluate.py           # script đánh giá
 ├── notebooks/
 │   ├── eda_vqav2.ipynb       # EDA dữ liệu VQAv2
-│   └── analysis.ipynb        # phân tích kết quả
+│   ├── pre-extracted + cached img.ipynb  # cache img to .H5 file
+│   ├── Dataset + Dataloader.ipynb        # viết hàm dataset và hàm dataloader
+│   └── test_ViT_pretrained.ipynb        # test model ViT
 ├── requirements.txt
+├── experiment-cases.md       # tất cả các case để thử nghiệm
 └── knowledge.md              # tài liệu kỹ thuật BLIP-2 + VQAv2
 ```
 
