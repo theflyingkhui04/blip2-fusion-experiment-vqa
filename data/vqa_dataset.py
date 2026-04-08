@@ -289,6 +289,18 @@ class VQAv2Dataset(Dataset):
                     f"Cache not found: {self._h5_path}\n"
                     "Run scripts/pre_extract_features.py first, or set use_cache=False."
                 )
+            # Filter samples to only those whose image_id exists in the cache.
+            # This handles partial caches (e.g. smoke-test extractions) gracefully
+            # instead of crashing with KeyError mid-training.
+            with h5py.File(self._h5_path, "r") as _h5:
+                cached_ids = set(_h5.keys())  # set of str(image_id)
+            before = len(self.samples)
+            self.samples = [s for s in self.samples if str(s["image_id"]) in cached_ids]
+            dropped = before - len(self.samples)
+            if dropped:
+                print(f"[VQAv2Dataset/{split}] WARNING: {dropped:,} samples dropped "
+                      f"(image_id not in cache). Cache coverage: "
+                      f"{len(self.samples):,}/{before:,}.")
 
         print(f"[VQAv2Dataset/{split}] {len(self.samples):,} samples | "
               f"vocab={len(self.answer_to_idx):,} | use_cache={use_cache}")
