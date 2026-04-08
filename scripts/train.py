@@ -105,6 +105,17 @@ def parse_args() -> argparse.Namespace:
                         help="Random seed.")
     parser.add_argument("--run_name", type=str, default=None,
                         help="Override tên W&B run.")
+    # Data path overrides
+    parser.add_argument("--data_root", type=str, default=None,
+                        help="Thư mục gốc chứa data (override config.data.data_root).")
+    parser.add_argument("--cache_dir", type=str, default=None,
+                        help="Tên thư mục cache HDF5 bên trong data_root (override config.data.cache_dir).")
+    parser.add_argument("--vqav2_dir", type=str, default=None,
+                        help="Tên thư mục VQAv2 JSON bên trong data_root (override config.data.vqav2_dir).")
+    parser.add_argument("--coco_dir", type=str, default=None,
+                        help="Tên thư mục COCO images bên trong data_root (override config.data.coco_dir).")
+    parser.add_argument("--answer_list", type=str, default=None,
+                        help="Đường dẫn đến answer_list.json (override config.data.answer_list).")
     return parser.parse_args()
 
 
@@ -130,6 +141,16 @@ def main() -> None:
         cfg_dict.setdefault("training", {})["seed"] = args.seed
     if args.run_name:
         cfg_dict.setdefault("logging", {})["run_name"] = args.run_name
+    if args.data_root:
+        cfg_dict.setdefault("data", {})["data_root"] = args.data_root
+    if args.cache_dir:
+        cfg_dict.setdefault("data", {})["cache_dir"] = args.cache_dir
+    if args.vqav2_dir:
+        cfg_dict.setdefault("data", {})["vqav2_dir"] = args.vqav2_dir
+    if args.coco_dir:
+        cfg_dict.setdefault("data", {})["coco_dir"] = args.coco_dir
+    if args.answer_list:
+        cfg_dict.setdefault("data", {})["answer_list"] = args.answer_list
 
     config = OmegaConf.create(cfg_dict)
 

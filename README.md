@@ -226,10 +226,16 @@ with h5py.File("/content/drive/MyDrive/VQAv2/features/train_features.h5", "r") a
 ### Bước 6: Train EXP-06
 
 ```bash
-# Train từ đầu
+# Train từ đầu, ví dụ EXP06
 !python scripts/train.py \
     --config configs/exp06.yaml \
-    --run_name "exp06_qformer_scratch_run1"
+    --run_name "exp06_qformer_scratch_run1" \
+    --data_root "/content/drive/MyDrive/blip2_project/data" \
+    --vqav2_dir "vqav2" \
+    --coco_dir  "coco" \
+    --cache_dir "cache" \
+    --answer_list "/content/drive/MyDrive/blip2_project/data/ans2idx.json" \
+    --output_dir "/content/drive/MyDrive/blip2_project/data/checkpoints/exp06"
 ```
 
 Script sẽ tự động:
