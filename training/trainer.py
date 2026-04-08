@@ -23,6 +23,7 @@ from configs.contracts import (
     KEY_BEST_VAL_METRIC,
     KEY_EPOCH,
     KEY_GLOBAL_STEP,
+    KEY_IMAGE_FEATURES,
     KEY_INPUT_IDS,
     KEY_LOGITS,
     KEY_LOSS,
@@ -73,6 +74,7 @@ class VQATrainer:
         mixed_precision: bool = True,
         eval_metric_fn: Optional[Callable] = None,
         log_every: int = 100,
+        text_encoder: Optional[nn.Module] = None,
     ) -> None:
         self.model = model
         self.train_loader = train_loader
@@ -87,6 +89,12 @@ class VQATrainer:
         self.gradient_clip = gradient_clip
         self.eval_metric_fn = eval_metric_fn
         self.log_every = log_every
+        # text_encoder (FrozenTextEncoder) dùng cho EXP fusion models (Phương án B).
+        # Nếu None → dùng legacy BLIP2VQA pipeline (pixel_values + input_ids).
+        self.text_encoder = text_encoder
+        if self.text_encoder is not None:
+            self.text_encoder = self.text_encoder.to(self.device)
+            self.text_encoder.eval()  # BERT luôn ở eval mode
 
         self.model = self.model.to(self.device)
 
@@ -219,22 +227,18 @@ class VQATrainer:
         return results
 
     def _forward_batch(self, batch: Dict) -> torch.Tensor:
-        """Chuyển batch lên device và tính loss."""
-        # Lấy các tensor từ batch theo đúng key contract
-        pixel_values = batch[KEY_PIXEL_VALUES].to(self.device)
+        """Chuyển batch lên device và tính loss.
 
-        input_ids = batch.get(KEY_INPUT_IDS)
-        if input_ids is not None:
-            input_ids = input_ids.to(self.device)
-
-        attention_mask = batch.get(KEY_ATTENTION_MASK)
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(self.device)
-
+        Hỗ trợ hai pipeline:
+          - **EXP pipeline** (khi ``self.text_encoder`` khác None):
+            Dùng ``KEY_IMAGE_FEATURES`` (HDF5 cache) + BERT → ``text_features``
+            → gọi ``model(visual_features, text_features)`` → tensor logits.
+          - **Legacy BLIP2VQA pipeline** (khi ``self.text_encoder`` là None):
+            Dùng ``KEY_PIXEL_VALUES`` + ``input_ids`` truyền thẳng vào model.
+        """
         answer_scores = batch.get(KEY_ANSWER_SCORES)
         if answer_scores is not None:
             answer_scores = answer_scores.to(self.device)
-
         answer_label = batch.get(KEY_ANSWER_LABEL)
         if answer_label is not None:
             answer_label = answer_label.to(self.device)
@@ -244,44 +248,85 @@ class VQATrainer:
             if self.scaler is not None
             else contextlib.nullcontext()
         )
-        with ctx:
+
+        if self.text_encoder is not None:
+            # --- EXP fusion model pipeline ---
+            visual_features = batch[KEY_IMAGE_FEATURES].to(self.device)  # [B, 257, 1024]
+            input_ids       = batch[KEY_INPUT_IDS].to(self.device)
+            attention_mask  = batch.get(KEY_ATTENTION_MASK)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(self.device)
+
+            # BERT luôn chạy ngoài AMP (tránh precision issues với BertLayerNorm)
+            # và trong no_grad (frozen — không cần lưu activation)
+            text_features = self.text_encoder(input_ids, attention_mask)  # [B, 768]
+
+            with ctx:
+                logits = self.model(visual_features, text_features)  # [B, num_answers]
+
+            targets = answer_scores if answer_scores is not None else answer_label
+            if targets is None:
+                return torch.tensor(0.0, device=self.device, requires_grad=True)
+            return self.loss_fn(logits, targets)
+
+        else:
+            # --- Legacy BLIP2VQA pipeline ---
+            pixel_values = batch[KEY_PIXEL_VALUES].to(self.device)
+            input_ids = batch.get(KEY_INPUT_IDS)
+            if input_ids is not None:
+                input_ids = input_ids.to(self.device)
+            attention_mask = batch.get(KEY_ATTENTION_MASK)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(self.device)
+
+            with ctx:
+                out = self.model(
+                    pixel_values=pixel_values,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    answer_scores=answer_scores,
+                )
+
+            if KEY_LOSS in out:
+                return out[KEY_LOSS]
+            if KEY_LOGITS in out:
+                targets = answer_scores if answer_scores is not None else answer_label
+                if targets is None:
+                    return torch.tensor(0.0, device=self.device, requires_grad=True)
+                return self.loss_fn(out[KEY_LOGITS], targets)
+
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+    @torch.no_grad()
+    def _get_predictions(self, batch: Dict):
+        """Trả về danh sách index câu trả lời dự đoán cho một batch."""
+        if self.text_encoder is not None:
+            # EXP pipeline
+            visual_features = batch[KEY_IMAGE_FEATURES].to(self.device)
+            input_ids       = batch[KEY_INPUT_IDS].to(self.device)
+            attention_mask  = batch.get(KEY_ATTENTION_MASK)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(self.device)
+            text_features = self.text_encoder(input_ids, attention_mask)
+            logits = self.model(visual_features, text_features)
+            return logits.argmax(dim=-1).tolist()
+        else:
+            # Legacy BLIP2VQA pipeline
+            pixel_values = batch[KEY_PIXEL_VALUES].to(self.device)
+            input_ids = batch.get(KEY_INPUT_IDS)
+            if input_ids is not None:
+                input_ids = input_ids.to(self.device)
+            attention_mask = batch.get(KEY_ATTENTION_MASK)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(self.device)
             out = self.model(
                 pixel_values=pixel_values,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                answer_scores=answer_scores,
             )
-
-        # Nếu model đã tính loss nội bộ thì dùng trực tiếp
-        if KEY_LOSS in out:
-            return out[KEY_LOSS]
-
-        # Ngược lại trainer tự tính loss từ logits
-        if KEY_LOGITS in out:
-            targets = answer_scores if answer_scores is not None else answer_label
-            if targets is None:
-                return torch.tensor(0.0, device=self.device, requires_grad=True)
-            return self.loss_fn(out[KEY_LOGITS], targets)
-
-        return torch.tensor(0.0, device=self.device, requires_grad=True)
-
-    @torch.no_grad()
-    def _get_predictions(self, batch: Dict):
-        pixel_values = batch[KEY_PIXEL_VALUES].to(self.device)
-        input_ids = batch.get(KEY_INPUT_IDS)
-        if input_ids is not None:
-            input_ids = input_ids.to(self.device)
-        attention_mask = batch.get(KEY_ATTENTION_MASK)
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(self.device)
-        out = self.model(
-            pixel_values=pixel_values,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        )
-        if KEY_LOGITS in out:
-            return out[KEY_LOGITS].argmax(dim=-1).tolist()
-        return []
+            if KEY_LOGITS in out:
+                return out[KEY_LOGITS].argmax(dim=-1).tolist()
+            return []
 
     # ------------------------------------------------------------------
     # Checkpointing
