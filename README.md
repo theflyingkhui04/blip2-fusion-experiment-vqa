@@ -30,15 +30,15 @@ Tập dữ liệu: **VQAv2** — 443,757 câu hỏi train, 214,354 câu hỏi va
 
 ## 2. Danh sách 7 thí nghiệm
 
-| ID | Tên | Mô tả | Tham số |
+| ID | Tên (`model.name`) | Mô tả | Tham số |
 |----|-----|-------|---------|
-| EXP-01 | `concat_mlp` | Concatenation + MLP đơn giản | ~1M |
-| EXP-02 | `bilinear` | Bilinear fusion (Tucker decomposition) | ~3M |
-| EXP-03 | `cross_attention` | Cross-attention 1 lớp | ~5M |
-| EXP-04 | `mlb` | MLB (Multimodal Low-rank Bilinear) | ~4M |
-| EXP-05 | `mutan` | MutAN (Multimodal Tucker Fusion) | ~6M |
+| EXP-01 | `mean_linear` | Mean Pooling + Linear (baseline tuyến tính) | ~5.6M |
+| EXP-02 | `concat_fusion` | Concat + MLP (1 lớp ẩn ReLU, fusion_dim=1024) | ~5M |
+| EXP-03 | `mlb_fusion` | MLB — Hadamard Bilinear (fusion_dim=2048) | ~14M |
+| EXP-04 | `mfb_fusion` | MFB — Factorized Bilinear (fusion_dim=1024, k=5) | ~13M |
+| EXP-05 | `cross_attn_fusion` | Cross-Attention Bridge (3 lớp, 32 query tokens) | ~27M |
 | EXP-06 | `qformer_scratch` | **Q-Former từ đầu** (12 lớp, 32 query tokens) | ~105M |
-| EXP-07 | `blip2_pretrained` | BLIP-2 pretrained + finetune classifier | ~188M |
+| EXP-07 | `perceiver_resampler` | Perceiver Resampler — Flamingo style (4 lớp, 64 latents) | ~58M |
 
 > **EXP-06** là thí nghiệm chính — tái hiện kiến trúc Q-Former của BLIP-2 từ đầu.
 
@@ -56,10 +56,16 @@ blip2-fusion-experiment-vqa/
 │   ├── vqa_dataset.py        # VQAv2Dataset — đọc HDF5 cache
 │   └── pre_extract_features.py  # trích xuất CLIP features → HDF5
 ├── models/
-│   ├── blip2_vqa.py          # EXP-07: BLIP-2 pretrained
-│   ├── fusion_baselines.py   # EXP-01 đến EXP-05
-│   ├── qformer.py            # EXP-06: QFormerScratch
-│   └── text_encoder.py       # FrozenTextEncoder (BERT-base)
+│   ├── exp01_mean_linear.py          # EXP-01: MeanLinearFusion
+│   ├── exp02_concat_mlp.py           # EXP-02: ConcatMLPFusion
+│   ├── exp03_mlb.py                  # EXP-03: MLBFusion (Hadamard Bilinear)
+│   ├── exp04_mfb.py                  # EXP-04: MFBFusion (Factorized Bilinear)
+│   ├── exp05_cross_attn.py           # EXP-05: CrossAttnFusion (Bridge)
+│   ├── exp06_qformer_scratch.py      # EXP-06: QFormerScratch
+│   ├── exp07_perceiver_resampler.py  # EXP-07: PerceiverResampler (Flamingo)
+│   ├── blip2_vqa.py                  # BLIP-2 pretrained wrapper
+│   ├── qformer.py                    # Q-Former core (dùng bởi EXP-06)
+│   └── text_encoder.py               # FrozenTextEncoder (BERT-base)
 ├── training/
 │   ├── trainer.py            # VQATrainer — vòng lặp train + checkpoint + W&B
 │   └── losses.py
@@ -360,13 +366,13 @@ Kết quả được lưu vào `output_dir/eval_results.json`:
 
 | EXP | Mô hình | Params | Val Accuracy | Best Epoch | Ghi chú |
 |-----|---------|--------|-------------|------------|---------|
-| EXP-01 | concat_mlp | ~1M | — | — | |
-| EXP-02 | bilinear | ~3M | — | — | |
-| EXP-03 | cross_attention | ~5M | — | — | |
-| EXP-04 | mlb | ~4M | — | — | |
-| EXP-05 | mutan | ~6M | — | — | |
+| EXP-01 | mean_linear | ~5.6M | — | — | Baseline tuyến tính |
+| EXP-02 | concat_fusion | ~5M | — | — | Concat + MLP |
+| EXP-03 | mlb_fusion | ~14M | — | — | Hadamard Bilinear |
+| EXP-04 | mfb_fusion | ~13M | — | — | Factorized Bilinear |
+| EXP-05 | cross_attn_fusion | ~27M | — | — | Cross-Attn Bridge |
 | EXP-06 | qformer_scratch | ~105M | — | — | Q-Former từ đầu |
-| EXP-07 | blip2_pretrained | ~188M | — | — | BLIP-2 finetune |
+| EXP-07 | perceiver_resampler | ~58M | — | — | Flamingo Perceiver |
 
 ---
 
