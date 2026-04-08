@@ -15,3 +15,6 @@ accelerate>=0.24.0
 datasets>=2.14.0
 evaluate>=0.4.0
 nltk>=3.8.0
+wandb>=0.16.0
+omegaconf>=2.3.0
+h5py>=3.9.0
