@@ -270,13 +270,23 @@ class VQAv2Dataset(Dataset):
         if answer_list_path and os.path.exists(str(answer_list_path)):
             with open(answer_list_path) as f:
                 raw_vocab = json.load(f)
-            self.idx_to_answer: List[str] = [normalize_answer(a) for a in raw_vocab]
-            self.answer_to_idx: Dict[str, int] = {
-                a: i for i, a in enumerate(self.idx_to_answer)
-            }
+            if isinstance(raw_vocab, dict):
+                # {answer: index} — preserve original indices (may be non-contiguous)
+                self.answer_to_idx: Dict[str, int] = {
+                    normalize_answer(a): int(idx) for a, idx in raw_vocab.items()
+                }
+            else:
+                # list of answers — assign indices 0..N-1
+                self.answer_to_idx = {
+                    normalize_answer(a): i for i, a in enumerate(raw_vocab)
+                }
+            self.idx_to_answer: List[str] = [""] * ANSWER_VOCAB_SIZE
+            for ans, idx in self.answer_to_idx.items():
+                if idx < ANSWER_VOCAB_SIZE:
+                    self.idx_to_answer[idx] = ans
         else:
             self.answer_to_idx = build_answer_vocab(ann_path, top_k=ANSWER_VOCAB_SIZE)
-            self.idx_to_answer = [""] * len(self.answer_to_idx)
+            self.idx_to_answer = [""] * ANSWER_VOCAB_SIZE
             for ans, idx in self.answer_to_idx.items():
                 self.idx_to_answer[idx] = ans
 
@@ -363,7 +373,7 @@ class VQAv2Dataset(Dataset):
         Returns:
             Float tensor of shape ``[ANSWER_VOCAB_SIZE]`` with values in ``[0, 1]``.
         """
-        scores = torch.zeros(len(self.answer_to_idx), dtype=torch.float)
+        scores = torch.zeros(ANSWER_VOCAB_SIZE, dtype=torch.float)
         answer_counts: Dict[str, int] = {}
         for ans in raw_answers:
             norm = normalize_answer(ans)
