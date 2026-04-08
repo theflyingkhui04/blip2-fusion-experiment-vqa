@@ -168,7 +168,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Pre-extract CLIP image features")
-    parser.add_argument("--data_root",   default="/content/data")
+    parser.add_argument("--data_root",   default="/content/drive/MyDrive/blip2_project/data")
     parser.add_argument("--split",       default="train", choices=["train", "val", "both"])
     parser.add_argument("--device",      default="cuda")
     parser.add_argument("--batch_size",  type=int, default=64)

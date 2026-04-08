@@ -36,12 +36,12 @@ data:
   # ║  Colab + Google Drive: đổi data_root → path trong Drive         ║
   # ║  Ví dụ: /content/drive/MyDrive/VQAv2                           ║
   # ╚══════════════════════════════════════════════════════════════════╝
-  data_root:    /content/drive/MyDrive/VQAv2
-  vqav2_dir:    annotations      # {data_root}/annotations/ chứa JSON files
-  coco_dir:     images           # {data_root}/images/ chứa train2014/ val2014/
-  cache_dir:    features         # {data_root}/features/ chứa *.h5 cache
+  data_root:    /content/drive/MyDrive/blip2_project/data
+  vqav2_dir:    vqav2            # {data_root}/vqav2/ chứa JSON files
+  coco_dir:     coco             # {data_root}/coco/ chứa train2014/ val2014/
+  cache_dir:    cache            # {data_root}/cache/ chứa *.h5 cache
 
-  answer_list:  /content/drive/MyDrive/VQAv2/annotations/answer_list.json
+  answer_list:  /content/drive/MyDrive/blip2_project/data/ans2idx.json
 
   # Kích thước subset — dùng toàn bộ VQAv2
   train_size:   443757
@@ -54,8 +54,8 @@ data:
   num_workers:  2                # Colab: 2 workers là đủ
 
 training:
-  output_dir:  /content/drive/MyDrive/VQAv2/checkpoints/exp06_qformer_scratch
-  log_dir:     /content/drive/MyDrive/VQAv2/logs/exp06_qformer_scratch
+  output_dir:  /content/drive/MyDrive/blip2_project/data/checkpoints/exp06
+  log_dir:     /content/drive/MyDrive/blip2_project/data/logs/exp06_qformer_scratch
   num_epochs:  10
   eval_batch_size: 64
   learning_rate: 1.0e-4
