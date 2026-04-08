@@ -1,7 +1,18 @@
 """Pre-extract ViT-L/14 (CLIP) image features for all COCO 2014 images.
 Outputs: data/cache/train_features.h5 and val_features.h5
          Key: str(image_id), Value: float16 array (257, 1024)
-Supports resume: skips image_ids already in the cache.
+
+Resume strategy:
+  - Checkpoint JSON (<cache>.ckpt.json) records all processed image_ids.
+  - HDF5 is flushed to disk every `checkpoint_interval` batches.
+  - On restart: merges checkpoint + HDF5 keys → no duplicate work.
+
+Notes:
+  - Does NOT call text_encoder.py — that encoder (BERT) runs inside the
+    trainer at training time; pre-extraction only handles frozen ViT.
+  - Uses VQAv2Dataset.SPLIT_FILES (class-level dict) for file/dir metadata;
+    does NOT instantiate VQAv2Dataset itself.
+  - Pass max_images to cap the number of images (useful for smoke-tests).
 """
 
 import json
@@ -22,49 +33,91 @@ def pre_extract_features(
     split: str,
     device: str = "cuda",
     batch_size: int = 64,
+    checkpoint_interval: int = 10,
+    max_images: int | None = None,
 ) -> None:
-    """Run ViT-L/14 on all COCO images for a split and save features to HDF5.
+    """Run ViT-L/14 on all (or a capped subset of) COCO images and save to HDF5.
 
     Each image is saved as float16 with shape (257, 1024):
       - 1 CLS token + 256 patch tokens (ViT-L/14 @ 224)
       - dim = 1024
 
     Args:
-        config:     OmegaConf config (data.* and model.image_encoder)
-        split:      "train" or "val"
-        device:     "cuda" or "cpu"
-        batch_size: images per forward pass (reduce if OOM)
+        config:               OmegaConf config (data.* and model.image_encoder)
+        split:                "train" or "val"
+        device:               "cuda" or "cpu"
+        batch_size:           images per forward pass (reduce if OOM)
+        checkpoint_interval:  flush HDF5 + write .ckpt.json every N batches
+        max_images:           cap total images processed (None = all).
+                              Set a small number (e.g. 50) to smoke-test the
+                              full pipeline without running on all 82k images.
     """
     cfg       = config.data
     data_root = cfg.data_root
     meta      = VQAv2Dataset.SPLIT_FILES[split]
 
-    img_dir    = os.path.join(data_root, cfg.coco_dir,    meta["img_dir"])
-    ann_path   = os.path.join(data_root, cfg.vqav2_dir,   meta["ann"])
+    img_dir    = os.path.join(data_root, cfg.coco_dir,  meta["img_dir"])
+    ann_path   = os.path.join(data_root, cfg.vqav2_dir, meta["ann"])
     cache_dir  = os.path.join(data_root, cfg.cache_dir)
     cache_path = os.path.join(cache_dir, meta["cache"])
+    ckpt_path  = cache_path + ".ckpt.json"
     os.makedirs(cache_dir, exist_ok=True)
 
     # All unique image_ids referenced in VQAv2 annotations
     with open(ann_path) as f:
         ann_data = json.load(f)
     image_ids = sorted({ann["image_id"] for ann in ann_data["annotations"]})
+
+    if max_images is not None:
+        image_ids = image_ids[:max_images]
+        print(f"[pre_extract/{split}] smoke-test mode: capped at {max_images} images")
+
     print(f"[pre_extract/{split}] {len(image_ids):,} unique images → {cache_path}")
 
-    # Load CLIP vision model
+    # ── Determine already-processed ids (checkpoint merge strategy) ──────────
+    done_ids: set = set()
+
+    if os.path.exists(ckpt_path):
+        with open(ckpt_path) as f:
+            done_ids = set(json.load(f).get("done", []))
+        print(f"  Checkpoint: {len(done_ids):,} ids from {os.path.basename(ckpt_path)}")
+
+    if os.path.exists(cache_path):
+        with h5py.File(cache_path, "r") as h5f:
+            h5_done = {int(k) for k in h5f.keys()}
+        extra = h5_done - done_ids
+        if extra:
+            print(f"  HDF5 has {len(extra):,} extra ids not in checkpoint — merging")
+        done_ids |= h5_done
+
+    to_process = [iid for iid in image_ids if iid not in done_ids]
+    print(f"  Already cached: {len(done_ids):,} | Remaining: {len(to_process):,}")
+
+    if not to_process:
+        print("  All images already cached. Nothing to do.")
+        return
+
+    # ── Load CLIP vision model ────────────────────────────────────────────────
     model_name = config.model.image_encoder
     print(f"Loading {model_name} ...")
     processor  = CLIPImageProcessor.from_pretrained(model_name)
     model      = CLIPVisionModel.from_pretrained(model_name).to(device).eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
     print(f"Model loaded on {device} ✅")
 
-    with h5py.File(cache_path, "a") as h5f:
-        existing   = set(h5f.keys())
-        to_process = [iid for iid in image_ids if str(iid) not in existing]
-        print(f"  Already cached: {len(existing):,} | Remaining: {len(to_process):,}")
+    # ── Extraction loop with periodic checkpoint ──────────────────────────────
+    saved_this_run = 0
+    n_batches = (len(to_process) + batch_size - 1) // batch_size
 
-        for i in tqdm(range(0, len(to_process), batch_size), desc=f"Extracting {split}"):
-            ids    = to_process[i : i + batch_size]
+    with h5py.File(cache_path, "a") as h5f:
+        pbar = tqdm(
+            range(0, len(to_process), batch_size),
+            total=n_batches,
+            desc=f"Extracting {split}",
+        )
+        for batch_num, i in enumerate(pbar):
+            ids = to_process[i : i + batch_size]
             imgs, valid_ids = [], []
 
             for iid in ids:
@@ -78,6 +131,7 @@ def pre_extract_features(
                     continue
 
             if not imgs:
+                done_ids.update(ids)  # mark missing as done so they aren't retried
                 continue
 
             inputs = processor(images=imgs, return_tensors="pt").to(device)
@@ -86,23 +140,61 @@ def pre_extract_features(
                 feats = feats.cpu().numpy().astype("float16")
 
             for j, iid in enumerate(valid_ids):
-                h5f.create_dataset(
-                    str(iid), data=feats[j],
-                    compression="gzip", compression_opts=1,
-                )
+                if str(iid) not in h5f:   # guard against duplicate on resume
+                    h5f.create_dataset(
+                        str(iid), data=feats[j],
+                        compression="gzip", compression_opts=1,
+                    )
 
-    print(f"✅ Done! Cache: {cache_path}")
+            done_ids.update(valid_ids)
+            saved_this_run += len(valid_ids)
+
+            # Flush HDF5 + write checkpoint every checkpoint_interval batches
+            if (batch_num + 1) % checkpoint_interval == 0:
+                h5f.flush()
+                with open(ckpt_path, "w") as f:
+                    json.dump({"done": list(done_ids)}, f)
+                pbar.set_postfix(saved=saved_this_run, total_cached=len(done_ids))
+
+        # Final flush + checkpoint for the last partial interval
+        h5f.flush()
+        with open(ckpt_path, "w") as f:
+            json.dump({"done": list(done_ids)}, f)
+
+    print(f"✅ Done! Saved {saved_this_run:,} images this run. Cache: {cache_path}")
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Pre-extract CLIP image features")
+    parser.add_argument("--data_root",   default="/content/data")
+    parser.add_argument("--split",       default="train", choices=["train", "val", "both"])
+    parser.add_argument("--device",      default="cuda")
+    parser.add_argument("--batch_size",  type=int, default=64)
+    parser.add_argument("--ckpt_every",  type=int, default=10,
+                        help="Flush + save checkpoint every N batches")
+    parser.add_argument("--max_images",  type=int, default=None,
+                        help="Cap images for a smoke-test (e.g. --max_images 50)")
+    args = parser.parse_args()
+
     cfg = OmegaConf.create({
         "data": {
-            "data_root": "/content/data",
+            "data_root": args.data_root,
             "vqav2_dir": "vqav2", "coco_dir": "coco", "cache_dir": "cache",
             "train_size": 50000, "val_size": 10000,
             "image_size": 224, "seed": 42, "batch_size": 32,
         },
         "model": {"image_encoder": "openai/clip-vit-large-patch14", "query_dim": 768},
     })
-    for s in ["train", "val"]:
-        pre_extract_features(cfg, s, device="cuda", batch_size=64)
+
+    splits = ["train", "val"] if args.split == "both" else [args.split]
+    for s in splits:
+        pre_extract_features(
+            cfg,
+            split=s,
+            device=args.device,
+            batch_size=args.batch_size,
+            checkpoint_interval=args.ckpt_every,
+            max_images=args.max_images,
+        )
