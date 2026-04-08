@@ -57,6 +57,9 @@ class VQATrainer:
         eval_metric_fn: Callable tuỳ chọn ``(predictions, targets) → float``
             dùng để tính metric scalar khi validation.
         log_every: Ghi log mỗi *N* optimizer steps.
+        text_encoder: FrozenTextEncoder cho EXP pipeline (None = legacy BLIP2VQA).
+        wandb_run: Đối tượng ``wandb.Run`` đang active (None = không log W&B).
+            Truyền vào từ ``scripts/train.py`` sau khi gọi ``wandb.init()``.
     """
 
     def __init__(
@@ -75,6 +78,7 @@ class VQATrainer:
         eval_metric_fn: Optional[Callable] = None,
         log_every: int = 100,
         text_encoder: Optional[nn.Module] = None,
+        wandb_run=None,
     ) -> None:
         self.model = model
         self.train_loader = train_loader
@@ -96,6 +100,9 @@ class VQATrainer:
             self.text_encoder = self.text_encoder.to(self.device)
             self.text_encoder.eval()  # BERT luôn ở eval mode
 
+        # wandb_run: đối tượng wandb.Run hoặc None (không bắt buộc cài wandb)
+        self.wandb_run = wandb_run
+
         self.model = self.model.to(self.device)
 
         # AMP scaler
@@ -110,13 +117,24 @@ class VQATrainer:
     # Public API
     # ------------------------------------------------------------------
 
-    def train(self, num_epochs: int) -> None:
-        """Huấn luyện trong *num_epochs* epoch.
+    def train(self, num_epochs: int, start_epoch: int = 0) -> None:
+        """Huấn luyện từ *start_epoch+1* đến *num_epochs*.
 
         Args:
-            num_epochs: Số epoch huấn luyện.
+            num_epochs:   Tổng số epoch cần huấn luyện.
+            start_epoch:  Epoch đã hoàn thành trước đó (từ checkpoint).
+                          Train sẽ bắt đầu từ ``start_epoch + 1``.
+                          Nếu ``start_epoch >= num_epochs`` thì không làm gì.
         """
-        for epoch in range(1, num_epochs + 1):
+        if start_epoch >= num_epochs:
+            logger.info("start_epoch=%d >= num_epochs=%d — không cần train thêm.",
+                        start_epoch, num_epochs)
+            return
+
+        logger.info("Bắt đầu từ epoch %d, train đến epoch %d.",
+                    start_epoch + 1, num_epochs)
+
+        for epoch in range(start_epoch + 1, num_epochs + 1):
             logger.info("=== Epoch %d / %d ===", epoch, num_epochs)
             train_loss = self._train_epoch(epoch)
             val_results = self._val_epoch(epoch)
@@ -128,9 +146,16 @@ class VQATrainer:
                 val_results[KEY_LOSS],
             )
 
-            # Bước scheduler theo epoch
-            if self.scheduler is not None:
-                self.scheduler.step()
+            # Log epoch-level metrics lên W&B
+            if self.wandb_run is not None:
+                log_dict = {
+                    "epoch": epoch,
+                    "train/loss_epoch": train_loss,
+                    "val/loss":         val_results[KEY_LOSS],
+                }
+                if "metric" in val_results:
+                    log_dict["val/accuracy"] = val_results["metric"]
+                self.wandb_run.log(log_dict, step=self.global_step)
 
             # Lưu checkpoint sau mỗi epoch
             metric = val_results.get("metric", -val_results[KEY_LOSS])
@@ -189,14 +214,32 @@ class VQATrainer:
                 self.optimizer.zero_grad()
                 self.global_step += 1
 
+                # Bước scheduler theo gradient step để cosine decay hoạt động đúng
+                # (T_max = num_training_steps — không phải num_epochs)
+                if self.scheduler is not None:
+                    self.scheduler.step()
+
                 if self.global_step % self.log_every == 0:
                     elapsed = time.time() - t0
+                    cur_loss = loss.item() * self.gradient_accumulation_steps
+                    cur_lr   = self.optimizer.param_groups[0]["lr"]
                     logger.info(
-                        "Step %d | loss=%.4f | %.1f steps/s",
+                        "Step %d | loss=%.4f | lr=%.2e | %.1f steps/s",
                         self.global_step,
-                        loss.item() * self.gradient_accumulation_steps,
+                        cur_loss,
+                        cur_lr,
                         self.log_every / elapsed,
                     )
+                    # Log step-level metrics lên W&B
+                    if self.wandb_run is not None:
+                        self.wandb_run.log(
+                            {
+                                "train/loss": cur_loss,
+                                "train/lr":   cur_lr,
+                                "train/steps_per_sec": self.log_every / elapsed,
+                            },
+                            step=self.global_step,
+                        )
                     t0 = time.time()
 
             total_loss += loss.item() * self.gradient_accumulation_steps
@@ -353,6 +396,10 @@ class VQATrainer:
             best_path = self.output_dir / "best_model.pth"
             torch.save(state, best_path)
             logger.info("Best model mới được lưu (metric=%.4f)", metric)
+            # Đánh dấu best checkpoint lên W&B
+            if self.wandb_run is not None:
+                self.wandb_run.summary["best_val_metric"] = metric
+                self.wandb_run.summary["best_epoch"]      = epoch
 
     def load_checkpoint(self, checkpoint_path: str) -> int:
         """Tải checkpoint và khôi phục trạng thái model / optimizer.

@@ -1,52 +1,378 @@
-# Deep Learning assignment
+# BLIP-2 Fusion Experiment — VQA
 
-## Topic: Exploring BLIP-2 for VQA and enhancing nultimodal fusion with perceiver-based architecture
+**Deep Learning Assignment** — Khám phá kiến trúc Q-Former của BLIP-2 và so sánh nhiều chiến lược fusion đa phương thức trên tập VQAv2.
 
-Description: Team experiments on Visual Question Answering (VQA) tasks that integrates BLIP-2's Q-Former architecture with multiple fusion baselines for systematic comparison.
+---
 
-## Overview
+## Mục lục
 
-This repository implements:
-- **BLIP-2 Q-Former** – query transformer that bridges a frozen vision encoder with a language model
-- **Fusion Baselines** – concatenation, bilinear, attention-based, and MLB fusion strategies
-- **Training & Evaluation** – full training loop, VQAv2 accuracy metric, and checkpoint management
-- **Scripts** – train, evaluate, feature extraction, and interactive demo
+1. [Giới thiệu](#1-giới-thiệu)
+2. [Danh sách 7 thí nghiệm](#2-danh-sách-7-thí-nghiệm)
+3. [Cấu trúc thư mục](#3-cấu-trúc-thư-mục)
+4. [Chuẩn bị dữ liệu trên Google Drive](#4-chuẩn-bị-dữ-liệu-trên-google-drive)
+5. [Hướng dẫn train trên Google Colab (từng bước)](#5-hướng-dẫn-train-trên-google-colab-từng-bước)
+6. [Quản lý quá trình training bằng W&B](#6-quản-lý-quá-trình-training-bằng-wb)
+7. [Đánh giá mô hình](#7-đánh-giá-mô-hình)
+8. [Bảng so sánh kết quả](#8-bảng-so-sánh-kết-quả)
 
-## Project Structure
+---
+
+## 1. Giới thiệu
+
+Dự án nghiên cứu Visual Question Answering (VQA) kết hợp:
+- **Frozen CLIP ViT-L/14** — trích xuất đặc trưng ảnh (patch features `[B, 257, 1024]`)
+- **Frozen BERT-base** — trích xuất đặc trưng câu hỏi (CLS token `[B, 768]`)
+- **7 kiến trúc fusion** khác nhau để so sánh hiệu quả từ đơn giản → phức tạp
+
+Tập dữ liệu: **VQAv2** — 443,757 câu hỏi train, 214,354 câu hỏi val.
+
+---
+
+## 2. Danh sách 7 thí nghiệm
+
+| ID | Tên | Mô tả | Tham số |
+|----|-----|-------|---------|
+| EXP-01 | `concat_mlp` | Concatenation + MLP đơn giản | ~1M |
+| EXP-02 | `bilinear` | Bilinear fusion (Tucker decomposition) | ~3M |
+| EXP-03 | `cross_attention` | Cross-attention 1 lớp | ~5M |
+| EXP-04 | `mlb` | MLB (Multimodal Low-rank Bilinear) | ~4M |
+| EXP-05 | `mutan` | MutAN (Multimodal Tucker Fusion) | ~6M |
+| EXP-06 | `qformer_scratch` | **Q-Former từ đầu** (12 lớp, 32 query tokens) | ~105M |
+| EXP-07 | `blip2_pretrained` | BLIP-2 pretrained + finetune classifier | ~188M |
+
+> **EXP-06** là thí nghiệm chính — tái hiện kiến trúc Q-Former của BLIP-2 từ đầu.
+
+---
+
+## 3. Cấu trúc thư mục
 
 ```
-blip2-qformer-vqa/
-├── README.md
-├── requirements.txt
-├── .gitignore
+blip2-fusion-experiment-vqa/
 ├── configs/
-│   └── default.yaml
+│   ├── contracts.py          # dataclass cho config validation
+│   ├── default.yaml          # config mặc định (dùng cho local)
+│   └── exp06.yaml            # config EXP-06 (đường dẫn Colab + Drive)
 ├── data/
-│   ├── __init__.py
-│   └── vqa_dataset.py
+│   ├── vqa_dataset.py        # VQAv2Dataset — đọc HDF5 cache
+│   └── pre_extract_features.py  # trích xuất CLIP features → HDF5
 ├── models/
-│   ├── __init__.py
-│   ├── qformer.py
-│   ├── fusion_baselines.py
-│   └── blip2_vqa.py
+│   ├── blip2_vqa.py          # EXP-07: BLIP-2 pretrained
+│   ├── fusion_baselines.py   # EXP-01 đến EXP-05
+│   ├── qformer.py            # EXP-06: QFormerScratch
+│   └── text_encoder.py       # FrozenTextEncoder (BERT-base)
 ├── training/
-│   ├── __init__.py
-│   ├── trainer.py
+│   ├── trainer.py            # VQATrainer — vòng lặp train + checkpoint + W&B
 │   └── losses.py
 ├── evaluation/
-│   ├── __init__.py
-│   └── vqa_eval.py
+│   └── vqa_eval.py           # VQA accuracy metric
 ├── scripts/
-│   ├── train.py
-│   ├── evaluate.py
-│   ├── extract_features.py
-│   └── demo.py
+│   ├── train.py              # script train chính (auto-resume + W&B)
+│   └── evaluate.py           # script đánh giá
 ├── notebooks/
-│   └── analysis.ipynb
-└── utils/
-    ├── __init__.py
-    └── helpers.py
+│   ├── eda_vqav2.ipynb       # EDA dữ liệu VQAv2
+│   └── analysis.ipynb        # phân tích kết quả
+├── requirements.txt
+└── knowledge.md              # tài liệu kỹ thuật BLIP-2 + VQAv2
 ```
 
-## Knowledge
-All knowledge of BLIP-2 model and VQAv2 dataset included in "knowledge.md"
+---
+
+## 4. Chuẩn bị dữ liệu trên Google Drive
+
+Tổ chức thư mục trong Google Drive theo cấu trúc sau:
+
+```
+MyDrive/VQAv2/
+├── annotations/
+│   ├── v2_OpenEnded_mscoco_train2014_questions.json
+│   ├── v2_mscoco_train2014_annotations.json
+│   ├── v2_OpenEnded_mscoco_val2014_questions.json
+│   ├── v2_mscoco_val2014_annotations.json
+│   └── answer_list.json          ← danh sách 3129 câu trả lời
+├── images/
+│   ├── train2014/                ← ~83k ảnh (~13GB)
+│   └── val2014/                  ← ~41k ảnh (~6GB)
+└── features/                     ← HDF5 cache (tạo ở bước 5)
+    ├── train_features.h5         ← ~7GB sau khi extract
+    └── val_features.h5           ← ~3.5GB sau khi extract
+```
+
+> **Lưu ý:** Thư mục `features/` sẽ được tạo tự động khi chạy bước pre-extract.  
+> Sau khi có HDF5 cache, pipeline **không cần ảnh gốc** nữa — tiết kiệm VRAM.
+
+---
+
+## 5. Hướng dẫn train trên Google Colab (từng bước)
+
+### Bước 0: Mở Colab và chọn GPU
+
+1. Vào [colab.research.google.com](https://colab.research.google.com)
+2. **Runtime → Change runtime type → T4 GPU** (hoặc A100 nếu có Colab Pro)
+3. Kiểm tra GPU:
+   ```python
+   !nvidia-smi
+   ```
+
+---
+
+### Bước 1: Mount Google Drive và clone repo
+
+```python
+from google.colab import drive
+drive.mount('/content/drive')
+```
+
+```bash
+# Clone repo vào Colab
+%cd /content
+!git clone https://github.com/<your-username>/blip2-fusion-experiment-vqa.git
+%cd blip2-fusion-experiment-vqa
+```
+
+> Thay `<your-username>` bằng tên tài khoản GitHub của bạn.
+
+---
+
+### Bước 2: Cài đặt dependencies
+
+```bash
+!pip install -r requirements.txt -q
+```
+
+Kiểm tra các gói quan trọng đã cài đúng:
+
+```python
+import torch, transformers, wandb
+print(f"PyTorch: {torch.__version__}")
+print(f"CUDA available: {torch.cuda.is_available()}")
+print(f"Transformers: {transformers.__version__}")
+print(f"W&B: {wandb.__version__}")
+```
+
+---
+
+### Bước 3: Đăng nhập W&B
+
+```python
+import wandb
+wandb.login()
+# Nhập API key khi được hỏi
+# Lấy API key tại: https://wandb.ai/authorize
+```
+
+Hoặc dùng biến môi trường (không cần nhập tay):
+
+```python
+import os
+os.environ["WANDB_API_KEY"] = "your_api_key_here"  # dán API key vào đây
+```
+
+---
+
+### Bước 4: Kiểm tra và điều chỉnh config
+
+```bash
+!cat configs/exp06.yaml
+```
+
+Nếu đường dẫn Drive của bạn khác, sửa nhanh bằng Python:
+
+```python
+import yaml, pathlib
+
+cfg_path = pathlib.Path("configs/exp06.yaml")
+cfg = yaml.safe_load(cfg_path.read_text())
+
+cfg["data"]["data_root"]   = "/content/drive/MyDrive/VQAv2"
+cfg["data"]["answer_list"] = "/content/drive/MyDrive/VQAv2/annotations/answer_list.json"
+cfg["training"]["output_dir"] = "/content/drive/MyDrive/VQAv2/checkpoints/exp06"
+
+cfg_path.write_text(yaml.dump(cfg, allow_unicode=True))
+print("Config đã cập nhật.")
+```
+
+---
+
+### Bước 5: Pre-extract CLIP features (chỉ cần làm 1 lần)
+
+> **Bỏ qua bước này nếu đã có `train_features.h5` và `val_features.h5` trong Drive.**
+
+```bash
+# Quá trình này mất ~2-3h trên T4 GPU
+!python data/pre_extract_features.py --config configs/exp06.yaml
+```
+
+Sau khi xong, kiểm tra:
+
+```python
+import h5py
+with h5py.File("/content/drive/MyDrive/VQAv2/features/train_features.h5", "r") as f:
+    print("Keys:", list(f.keys()))
+    print("Train features shape:", f["features"].shape)
+    # Kỳ vọng: (443757, 257, 1024)
+```
+
+---
+
+### Bước 6: Train EXP-06
+
+```bash
+# Train từ đầu
+!python scripts/train.py \
+    --config configs/exp06.yaml \
+    --run_name "exp06_qformer_scratch_run1"
+```
+
+Script sẽ tự động:
+- Khởi tạo W&B run với tên `exp06_qformer_scratch_run1`
+- Lưu checkpoint sau mỗi epoch vào `output_dir`
+- Log metrics lên W&B dashboard
+
+**Output mẫu:**
+```
+[2024-01-15 10:30:00] INFO | Bắt đầu huấn luyện EXP-06 từ epoch 1/10
+[2024-01-15 10:30:05] INFO | Epoch 1/10 | Step 100/13867 | Loss: 4.2315 | LR: 1.2e-05
+...
+[2024-01-15 11:45:00] INFO | Epoch 1 hoàn tất | Train Loss: 3.8421 | Val Acc: 42.31%
+[2024-01-15 11:45:01] INFO | Checkpoint lưu → .../checkpoint_epoch_1.pth
+```
+
+---
+
+### Bước 7: Resume sau khi Colab ngắt kết nối
+
+Khi Colab bị disconnect, chỉ cần chạy lại với flag `--resume auto`:
+
+```bash
+!python scripts/train.py \
+    --config configs/exp06.yaml \
+    --resume auto \
+    --run_name "exp06_qformer_scratch_run1"
+```
+
+Script tự động tìm checkpoint mới nhất trong `output_dir` và tiếp tục từ epoch đó.
+
+> **Quan trọng:** Giữ nguyên `--run_name` để W&B nhận ra run ID và tiếp tục cùng một run, không tạo run mới.
+
+Nếu muốn resume từ checkpoint cụ thể:
+
+```bash
+!python scripts/train.py \
+    --config configs/exp06.yaml \
+    --resume /content/drive/MyDrive/VQAv2/checkpoints/exp06/checkpoint_epoch_3.pth \
+    --run_name "exp06_qformer_scratch_run1"
+```
+
+---
+
+### Bước 8: Giữ kết nối Colab không bị timeout
+
+Dán đoạn JavaScript sau vào **Console** của trình duyệt (F12 → Console):
+
+```javascript
+function ClickConnect(){
+  console.log("Giữ kết nối Colab...");
+  document.querySelector("#top-toolbar > colab-connect-button")
+    .shadowRoot.querySelector("#connect").click();
+}
+setInterval(ClickConnect, 60000);
+```
+
+---
+
+## 6. Quản lý quá trình training bằng W&B
+
+### 6.1 Đăng ký tài khoản
+
+1. Vào [wandb.ai](https://wandb.ai) → Sign up (miễn phí)
+2. Vào [wandb.ai/authorize](https://wandb.ai/authorize) → copy API key
+3. Dùng API key ở Bước 3 bên trên
+
+### 6.2 Các metric được log
+
+| Metric | Ý nghĩa | Kỳ vọng tốt |
+|--------|---------|-------------|
+| `train/loss` | Loss theo từng bước | Giảm đều |
+| `train/lr` | Learning rate (warmup → cosine decay) | Tăng → giảm dần |
+| `train/steps_per_sec` | Tốc độ xử lý | T4: ~8-12 steps/s |
+| `train/loss_epoch` | Loss trung bình mỗi epoch | Giảm qua các epoch |
+| `val/loss` | Loss trên tập val | Giảm theo epoch |
+| `val/accuracy` | VQA accuracy (%) | EXP-06: mục tiêu ≥55% |
+
+### 6.3 Xem Dashboard
+
+Sau khi training bắt đầu, vào **[wandb.ai/home](https://wandb.ai/home)** → chọn project **`blip2-vqa-experiment`**:
+
+- Tab **Charts**: biểu đồ loss + accuracy theo epoch/step
+- Tab **System**: GPU utilization, memory usage trong Colab
+- Tab **Overview**: hyperparameters, model config
+
+### 6.4 So sánh nhiều run
+
+1. Vào **Runs** trong project → chọn nhiều run → **Compare**
+2. Tạo biểu đồ `val/accuracy` vs epoch cho tất cả 7 EXP
+3. Tab **Table** → so sánh `best_val_metric` và `best_epoch`
+
+### 6.5 Cài đặt Alerts
+
+Vào **Settings → Notifications** trong W&B để nhận email khi:
+- Run kết thúc (succeeded / failed)
+- `val/accuracy` đạt ngưỡng cụ thể
+
+### 6.6 Resume cùng W&B run sau khi Colab crash
+
+Script `train.py` tự động lưu `wandb_run_id` vào `output_dir/wandb_run_id.txt`.  
+Khi resume với cùng `--run_name`, script đọc file này và gọi:
+
+```python
+wandb.init(resume="allow", id=<saved_run_id>)
+```
+
+Kết quả: biểu đồ W&B **liên tục, không bị gián đoạn** dù Colab crash nhiều lần.
+
+---
+
+## 7. Đánh giá mô hình
+
+```bash
+!python scripts/evaluate.py \
+    --config configs/exp06.yaml \
+    --checkpoint /content/drive/MyDrive/VQAv2/checkpoints/exp06/best_model.pth
+```
+
+Kết quả được lưu vào `output_dir/eval_results.json`:
+
+```json
+{
+  "overall_accuracy": 57.84,
+  "yes_no_accuracy": 84.21,
+  "number_accuracy": 46.37,
+  "other_accuracy": 51.09,
+  "num_samples": 214354
+}
+```
+
+---
+
+## 8. Bảng so sánh kết quả
+
+> Điền kết quả sau khi train xong từng EXP.
+
+| EXP | Mô hình | Params | Val Accuracy | Best Epoch | Ghi chú |
+|-----|---------|--------|-------------|------------|---------|
+| EXP-01 | concat_mlp | ~1M | — | — | |
+| EXP-02 | bilinear | ~3M | — | — | |
+| EXP-03 | cross_attention | ~5M | — | — | |
+| EXP-04 | mlb | ~4M | — | — | |
+| EXP-05 | mutan | ~6M | — | — | |
+| EXP-06 | qformer_scratch | ~105M | — | — | Q-Former từ đầu |
+| EXP-07 | blip2_pretrained | ~188M | — | — | BLIP-2 finetune |
+
+---
+
+## Tài liệu tham khảo
+
+- [BLIP-2 Paper](https://arxiv.org/abs/2301.12597) — Bootstrapping Language-Image Pre-training
+- [VQAv2 Dataset](https://visualqa.org/) — Making the V in VQA Matter
+- [W&B Docs](https://docs.wandb.ai/) — Weights & Biases documentation
+- `knowledge.md` — Tài liệu kỹ thuật chi tiết về BLIP-2 và VQAv2 trong repo này

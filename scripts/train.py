@@ -2,20 +2,32 @@
 
 Sử dụng
 -------
-python scripts/train.py --config configs/default.yaml
-python scripts/train.py --config configs/default.yaml --resume checkpoints/best_model.pth
+python scripts/train.py --config configs/exp06.yaml
+python scripts/train.py --config configs/exp06.yaml --resume auto        # tự tìm checkpoint mới nhất
+python scripts/train.py --config configs/exp06.yaml --resume path/to/ck.pth
 
 Ghi chú pipeline
 ----------------
 - Nếu ``model.name == "blip2_vqa"``: dùng BLIP2VQA legacy pipeline (pixel_values).
 - Ngược lại (EXP-01 → EXP-07): dùng EXP pipeline:
     HDF5 image_features + FrozenTextEncoder (BERT) → fusion model → logits.
+
+Auto-resume
+-----------
+  Truyền ``--resume auto`` hoặc đặt ``training.resume_from: auto`` trong YAML.
+  Script sẽ tự tìm checkpoint_epoch_*.pth mới nhất trong output_dir.
+
+W&B
+---
+  Đặt ``logging.use_wandb: true`` trong YAML và chạy ``wandb login`` trước.
+  Hoặc đặt biến môi trường WANDB_API_KEY trên Colab.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -40,6 +52,34 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _find_latest_checkpoint(output_dir: str) -> str | None:
+    """Tìm checkpoint_epoch_*.pth mới nhất trong output_dir."""
+    ckpt_dir = Path(output_dir)
+    if not ckpt_dir.exists():
+        return None
+    checkpoints = sorted(ckpt_dir.glob("checkpoint_epoch_*.pth"))
+    return str(checkpoints[-1]) if checkpoints else None
+
+
+def _resolve_resume(args_resume: str | None, config) -> str | None:
+    """Xử lý logic auto-resume: trả về đường dẫn checkpoint hoặc None."""
+    resume_val = args_resume or str(getattr(config.training, "resume_from", "") or "")
+    if not resume_val or resume_val.lower() == "null":
+        return None
+    if resume_val.lower() == "auto":
+        found = _find_latest_checkpoint(str(config.training.output_dir))
+        if found:
+            logger.info("Auto-resume: tìm thấy checkpoint %s", found)
+        else:
+            logger.info("Auto-resume: chưa có checkpoint, bắt đầu từ đầu.")
+        return found
+    return resume_val
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -52,7 +92,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=str, default="configs/default.yaml",
                         help="Đường dẫn file YAML config.")
     parser.add_argument("--resume", type=str, default=None,
-                        help="Checkpoint để tiếp tục huấn luyện.")
+                        help="Checkpoint để resume: đường dẫn cụ thể hoặc 'auto'.")
     parser.add_argument("--output_dir", type=str, default=None,
                         help="Override thư mục lưu checkpoint.")
     parser.add_argument("--device", type=str, default=None,
@@ -63,6 +103,8 @@ def parse_args() -> argparse.Namespace:
                         help="Override batch size.")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed.")
+    parser.add_argument("--run_name", type=str, default=None,
+                        help="Override tên W&B run.")
     return parser.parse_args()
 
 
@@ -86,6 +128,8 @@ def main() -> None:
         cfg_dict.setdefault("data", {})["batch_size"] = args.batch_size
     if args.seed:
         cfg_dict.setdefault("training", {})["seed"] = args.seed
+    if args.run_name:
+        cfg_dict.setdefault("logging", {})["run_name"] = args.run_name
 
     config = OmegaConf.create(cfg_dict)
 
@@ -95,6 +139,31 @@ def main() -> None:
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Sử dụng device: %s", device)
+
+    # ------------------------------------------------------------------
+    # Auto-resume: xác định checkpoint trước khi build model
+    # ------------------------------------------------------------------
+    resume_path = _resolve_resume(args.resume, config)
+
+    # ------------------------------------------------------------------
+    # W&B init (tùy chọn)
+    # ------------------------------------------------------------------
+    wandb_run = None
+    log_cfg = cfg_dict.get("logging", {})
+    if log_cfg.get("use_wandb", False):
+        try:
+            import wandb  # noqa: F401
+            run_name = log_cfg.get("run_name") or f"{config.model.name}"
+            wandb_run = wandb.init(
+                project=log_cfg.get("project", "blip2-vqa-experiment"),
+                name=run_name,
+                config=OmegaConf.to_container(config, resolve=True),
+                resume="allow",                   # cho phép resume run cũ (nếu cùng id)
+                id=log_cfg.get("wandb_run_id"),   # set trong YAML khi muốn resume run cụ thể
+            )
+            logger.info("W&B run: %s  (url: %s)", wandb_run.name, wandb_run.url)
+        except ImportError:
+            logger.warning("wandb chưa cài — bỏ qua W&B logging. `pip install wandb`")
 
     # ------------------------------------------------------------------
     # Data loaders — dùng HDF5 cache cho EXP models
@@ -135,7 +204,11 @@ def main() -> None:
     # Optimizer & Scheduler
     # ------------------------------------------------------------------
     optimizer = build_optimizer(model, cfg_dict)
-    num_training_steps = len(train_loader) * int(config.training.num_epochs)
+    num_training_steps = (
+        len(train_loader)
+        // int(getattr(config.training, "gradient_accumulation_steps", 1))
+        * int(config.training.num_epochs)
+    )
     scheduler = build_scheduler(optimizer, cfg_dict, num_training_steps)
 
     # ------------------------------------------------------------------
@@ -154,14 +227,33 @@ def main() -> None:
         gradient_clip=float(getattr(config.training, "gradient_clip", 1.0)),
         mixed_precision=bool(getattr(config.training, "mixed_precision", True)),
         text_encoder=text_encoder,
+        wandb_run=wandb_run,
     )
 
-    if args.resume:
-        logger.info("Tiếp tục từ checkpoint: %s", args.resume)
-        trainer.load_checkpoint(args.resume)
+    # ------------------------------------------------------------------
+    # Load checkpoint & tính start_epoch
+    # ------------------------------------------------------------------
+    start_epoch = 0
+    if resume_path:
+        start_epoch = trainer.load_checkpoint(resume_path)
+        logger.info("Tiếp tục từ epoch %d.", start_epoch + 1)
 
-    logger.info("Bắt đầu huấn luyện …")
-    trainer.train(num_epochs=int(config.training.num_epochs))
+    # ------------------------------------------------------------------
+    # Train
+    # ------------------------------------------------------------------
+    logger.info("Bắt đầu huấn luyện (epoch %d → %d) …",
+                start_epoch + 1, int(config.training.num_epochs))
+    try:
+        trainer.train(
+            num_epochs=int(config.training.num_epochs),
+            start_epoch=start_epoch,
+        )
+    finally:
+        # Đảm bảo W&B finish ngay cả khi crash / Colab ngắt
+        if wandb_run is not None:
+            wandb_run.finish()
+            logger.info("W&B run đã kết thúc.")
+
     logger.info("Huấn luyện hoàn tất.")
 
 
