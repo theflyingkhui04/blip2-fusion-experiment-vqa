@@ -19,6 +19,7 @@ from tqdm import tqdm
 from configs.contracts import (
     KEY_ANSWER_LABEL,
     KEY_ANSWER_SCORES,
+    KEY_ANSWER_TYPE,
     KEY_ATTENTION_MASK,
     KEY_BEST_VAL_METRIC,
     KEY_EPOCH,
@@ -28,9 +29,13 @@ from configs.contracts import (
     KEY_LOGITS,
     KEY_LOSS,
     KEY_MODEL_STATE,
+    KEY_NUMBER_ACC,
+    KEY_OTHER_ACC,
+    KEY_OVERALL_ACC,
     KEY_OPTIM_STATE,
     KEY_PIXEL_VALUES,
     KEY_SCHED_STATE,
+    KEY_YESNO_ACC,
     LOSS_BCE,
     EvalResult,
 )
@@ -140,21 +145,28 @@ class VQATrainer:
             val_results = self._val_epoch(epoch)
 
             logger.info(
-                "Epoch %d | train_loss=%.4f | val_loss=%.4f",
+                "Epoch %d | train_loss=%.4f | val_loss=%.4f | val_acc=%.4f "
+                "(yes/no=%.4f  number=%.4f  other=%.4f)",
                 epoch,
                 train_loss,
                 val_results[KEY_LOSS],
+                val_results.get(KEY_OVERALL_ACC, 0.0),
+                val_results.get(KEY_YESNO_ACC, 0.0),
+                val_results.get(KEY_NUMBER_ACC, 0.0),
+                val_results.get(KEY_OTHER_ACC, 0.0),
             )
 
             # Log epoch-level metrics lên W&B
             if self.wandb_run is not None:
                 log_dict = {
                     "epoch": epoch,
-                    "train/loss_epoch": train_loss,
-                    "val/loss":         val_results[KEY_LOSS],
+                    "train/loss_epoch":  train_loss,
+                    "val/loss":          val_results[KEY_LOSS],
+                    "val/acc":           val_results.get(KEY_OVERALL_ACC, 0.0),
+                    "val/acc_yesno":     val_results.get(KEY_YESNO_ACC, 0.0),
+                    "val/acc_number":    val_results.get(KEY_NUMBER_ACC, 0.0),
+                    "val/acc_other":     val_results.get(KEY_OTHER_ACC, 0.0),
                 }
-                if "metric" in val_results:
-                    log_dict["val/accuracy"] = val_results["metric"]
                 self.wandb_run.log(log_dict, step=self.global_step)
 
             # Lưu checkpoint sau mỗi epoch
@@ -250,22 +262,78 @@ class VQATrainer:
     def _val_epoch(self, epoch: int) -> EvalResult:
         self.model.eval()
         total_loss = 0.0
-        all_preds, all_targets = [], []
+
+        # Accumulators for VQA accuracy (soft-target per-type)
+        type_scores: Dict[str, list] = {"yes/no": [], "number": [], "other": []}
+        all_scores: list = []
 
         for batch in tqdm(self.val_loader, desc=f"Val Epoch {epoch}", leave=False):
             loss = self._forward_batch(batch)
             total_loss += loss.item()
 
-            if self.eval_metric_fn is not None:
-                preds = self._get_predictions(batch)
-                all_preds.extend(preds)
-                if KEY_ANSWER_LABEL in batch:
-                    all_targets.extend(batch[KEY_ANSWER_LABEL].tolist())
+            # ── Compute soft VQA accuracy in same pass ────────────────────
+            answer_scores = batch.get(KEY_ANSWER_SCORES)  # [B, num_answers]
+            answer_types  = batch.get(KEY_ANSWER_TYPE)    # List[str] or None
 
-        results: EvalResult = {KEY_LOSS: total_loss / max(len(self.val_loader), 1)}  # type: ignore[misc]
+            if answer_scores is not None:
+                # Get logits to find predicted class
+                if self.text_encoder is not None:
+                    visual_features = batch[KEY_IMAGE_FEATURES].to(self.device)
+                    input_ids       = batch[KEY_INPUT_IDS].to(self.device)
+                    attention_mask  = batch.get(KEY_ATTENTION_MASK)
+                    if attention_mask is not None:
+                        attention_mask = attention_mask.to(self.device)
+                    text_features = self.text_encoder(input_ids, attention_mask)
+                    logits = self.model(visual_features, text_features)
+                else:
+                    pixel_values = batch[KEY_PIXEL_VALUES].to(self.device)
+                    input_ids = batch.get(KEY_INPUT_IDS)
+                    if input_ids is not None:
+                        input_ids = input_ids.to(self.device)
+                    attention_mask = batch.get(KEY_ATTENTION_MASK)
+                    if attention_mask is not None:
+                        attention_mask = attention_mask.to(self.device)
+                    out = self.model(
+                        pixel_values=pixel_values,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                    )
+                    logits = out.get(KEY_LOGITS, out) if isinstance(out, dict) else out
 
-        if self.eval_metric_fn is not None and all_targets:
-            results["metric"] = self.eval_metric_fn(all_preds, all_targets)
+                pred_idx = logits.argmax(dim=-1).cpu()  # [B]
+                scores_cpu = answer_scores.cpu()        # [B, num_answers]
+
+                # Soft VQA acc per sample = answer_scores[b, pred_idx[b]]
+                batch_accs = scores_cpu[
+                    torch.arange(len(pred_idx)), pred_idx
+                ].tolist()
+
+                all_scores.extend(batch_accs)
+
+                if answer_types is not None:
+                    for acc, atype in zip(batch_accs, answer_types):
+                        bucket = atype if atype in type_scores else "other"
+                        type_scores[bucket].append(acc)
+
+        num_batches = max(len(self.val_loader), 1)
+        results: EvalResult = {KEY_LOSS: total_loss / num_batches}  # type: ignore[misc]
+
+        if all_scores:
+            overall = sum(all_scores) / len(all_scores)
+            results[KEY_OVERALL_ACC] = overall
+            results["metric"] = overall  # used by checkpoint logic
+            results[KEY_YESNO_ACC] = (
+                sum(type_scores["yes/no"]) / len(type_scores["yes/no"])
+                if type_scores["yes/no"] else 0.0
+            )
+            results[KEY_NUMBER_ACC] = (
+                sum(type_scores["number"]) / len(type_scores["number"])
+                if type_scores["number"] else 0.0
+            )
+            results[KEY_OTHER_ACC] = (
+                sum(type_scores["other"]) / len(type_scores["other"])
+                if type_scores["other"] else 0.0
+            )
 
         return results
 
