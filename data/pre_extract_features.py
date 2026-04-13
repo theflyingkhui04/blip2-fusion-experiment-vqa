@@ -190,17 +190,15 @@ if __name__ == "__main__":
 
     # --output_dir overrides data_root/cache_dir khi được truyền vào
     # Nếu không truyền, dùng data_root/cache (hành vi cũ)
-    cache_dir_cfg = "cache"   # relative to data_root
+    import os as _os
     if args.output_dir:
-        # Đặt data_root = output_dir, cache_dir = "" để pre_extract_features
-        # ghi thẳng vào output_dir (không thêm sub-dir)
-        # Trick: dùng os.path.dirname + basename
-        import os as _os
-        _abs = _os.path.abspath(args.output_dir)
-        _data_root_eff = _os.path.dirname(_abs)
-        cache_dir_cfg  = _os.path.basename(_abs)
+        # data_root vẫn dùng args.data_root để đọc annotation + ảnh
+        # cache_dir dùng absolute path → os.path.join sẽ bỏ qua data_root
+        _data_root_eff = args.data_root
+        cache_dir_cfg  = _os.path.abspath(args.output_dir)
     else:
         _data_root_eff = args.data_root
+        cache_dir_cfg  = "cache"
 
     cfg = OmegaConf.create({
         "data": {
