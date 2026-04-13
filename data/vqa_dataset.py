@@ -517,14 +517,19 @@ def build_dataloader(
         A :class:`torch.utils.data.DataLoader` with :func:`collate_fn` applied.
     """
     dataset = VQAv2Dataset(split, config, use_cache=use_cache)
+    num_workers = int(getattr(config.data, "num_workers", 4))
     return DataLoader(
         dataset,
         batch_size=int(config.data.batch_size),
         shuffle=(split == "train"),
-        num_workers=int(getattr(config.data, "num_workers", 4)),
+        num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=True,
         drop_last=(split == "train"),
+        # Giữ worker processes sống giữa các epoch để tokenizer singleton
+        # (_tokenizer) không bị khởi tạo lại và không trigger HTTP request
+        # đến HuggingFace mỗi epoch.
+        persistent_workers=(num_workers > 0),
     )
 
 
