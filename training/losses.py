@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,6 +12,7 @@ from configs.contracts import (
     LABEL_IGNORE_INDEX,
     LOSS_BCE,
     LOSS_CE,
+    LOSS_FOCAL_BCE,
     LOSS_KL,
     VALID_LOSS_TYPES,
 )
@@ -18,7 +21,7 @@ from configs.contracts import (
 class VQALoss(nn.Module):
     """Hàm loss kết hợp cho các thí nghiệm VQA.
 
-    Hỗ trợ ba mục tiêu huấn luyện:
+    Hỗ trợ bốn mục tiêu huấn luyện:
 
     * **Soft-target BCE** (``"bce"``): binary cross-entropy so với soft scores
       của từng đáp án, được tính từ annotation VQA (``min(count / 3, 1)``).
@@ -27,11 +30,20 @@ class VQALoss(nn.Module):
       hard label duy nhất. Phù hợp khi fine-tune generative decoder.
     * **KL divergence** (``"kl"``): coi soft scores như một phân phối xác
       suất hợp lệ và tối thiểu hoá KL divergence.
+    * **Focal BCE** (``"focal_bce"``): biến thể BCE với focal weighting
+      ``(1 - p_t)^gamma`` — giảm ảnh hưởng của các answers dễ (yes/no) và
+      tập trung gradient vào các answers khó (open-ended "other").
+      Đặc biệt hiệu quả khi "other" accuracy thấp do soft targets thưa.
 
     Args:
-        loss_type: Một trong ``"bce"``, ``"ce"``, hoặc ``"kl"``.
+        loss_type: Một trong ``"bce"``, ``"ce"``, ``"kl"``, ``"focal_bce"``.
         label_smoothing: Label smoothing cho loss ``"ce"`` (0.0 = tắt).
         reduction: ``"mean"`` hoặc ``"sum"``.
+        focal_gamma: Exponent của focal weight ``(1-p_t)^gamma``.
+            Chỉ có hiệu lực khi ``loss_type="focal_bce"``.
+            Giá trị thường dùng: 1.0–2.0 (mặc định 1.5).
+        focal_alpha: Trọng số balance positive/negative trong Focal BCE.
+            ``None`` = không dùng alpha weighting (mặc định).
     """
 
     def __init__(
@@ -39,6 +51,8 @@ class VQALoss(nn.Module):
         loss_type: str = LOSS_BCE,
         label_smoothing: float = 0.0,
         reduction: str = "mean",
+        focal_gamma: float = 1.5,
+        focal_alpha: Optional[float] = None,
     ) -> None:
         super().__init__()
 
@@ -48,6 +62,8 @@ class VQALoss(nn.Module):
             )
         self.loss_type = loss_type
         self.reduction = reduction
+        self.focal_gamma = focal_gamma
+        self.focal_alpha = focal_alpha
 
         if loss_type == LOSS_CE:
             self.ce = nn.CrossEntropyLoss(
@@ -84,6 +100,23 @@ class VQALoss(nn.Module):
                 labels.float(),
                 reduction=self.reduction,
             )
+
+        if self.loss_type == LOSS_FOCAL_BCE:
+            # Focal BCE: L = -(1 - p_t)^gamma * log(p_t)
+            # Giảm gradient của easy examples (yes/no với p_t cao)
+            # Tăng gradient của hard examples (open-ended "other" với p_t thấp)
+            targets = labels.float()
+            # BCE per element (no reduction)
+            bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+            # p_t = sigmoid cho positives, 1-sigmoid cho negatives
+            probs = torch.sigmoid(logits)
+            p_t = probs * targets + (1.0 - probs) * (1.0 - targets)
+            focal_weight = (1.0 - p_t) ** self.focal_gamma
+            if self.focal_alpha is not None:
+                alpha_t = self.focal_alpha * targets + (1.0 - self.focal_alpha) * (1.0 - targets)
+                focal_weight = alpha_t * focal_weight
+            loss = focal_weight * bce  # [B, V]
+            return loss.mean() if self.reduction == "mean" else loss.sum()
 
         # KL divergence — chuẩn hoá soft scores thành phân phối xác suất hợp lệ
         eps = 1e-8

@@ -207,18 +207,48 @@ print("Config đã cập nhật.")
 > **Bỏ qua bước này nếu đã có `train_features.h5` và `val_features.h5` trong Drive.**
 
 ```bash
-# Quá trình này mất ~2-3h trên T4 GPU
-!python data/pre_extract_features.py --config configs/exp06.yaml
+# Extract cả train + val (~2-3h trên T4 GPU)
+!python data/pre_extract_features.py \
+    --split       both \
+    --data_root   "/content/drive/MyDrive/blip2_project/data" \
+    --output_dir  "/content/drive/MyDrive/blip2_project/data/cache" \
+    --vqav2_dir   "vqav2" \
+    --coco_dir    "coco"
 ```
 
-Sau khi xong, kiểm tra:
+**Tham số đầy đủ:**
+
+| Tham số | Mặc định | Mô tả |
+|---------|----------|-------|
+| `--data_root` | *(bắt buộc)* | Thư mục gốc chứa ảnh COCO và annotation VQAv2 |
+| `--output_dir` | `{data_root}/cache` | **Thư mục lưu HDF5** — override hoàn toàn `data_root/cache_dir`. Dùng khi muốn lưu sang ổ khác hoặc đường dẫn tùy ý |
+| `--vqav2_dir` | `vqav2` | Tên thư mục JSON annotation bên trong `data_root` |
+| `--coco_dir` | `coco` | Tên thư mục ảnh COCO bên trong `data_root` |
+| `--model` | `openai/clip-vit-large-patch14` | HuggingFace model id của CLIP vision encoder |
+| `--split` | `train` | `train` \| `val` \| `both` |
+| `--batch_size` | `64` | Số ảnh mỗi forward pass (giảm nếu OOM) |
+| `--ckpt_every` | `10` | Flush HDF5 + lưu `.ckpt.json` mỗi N batch (resume-safe) |
+| `--max_images` | `None` | Giới hạn số ảnh — dùng để smoke-test nhanh (ví dụ `50`) |
+
+**Ví dụ smoke-test (~30 giây) trước khi chạy full:**
+
+```bash
+!python data/pre_extract_features.py \
+    --split       train \
+    --data_root   "/content/drive/MyDrive/blip2_project/data" \
+    --output_dir  "/content/drive/MyDrive/blip2_project/data/cache" \
+    --max_images  50
+```
+
+Sau khi xong, kiểm tra file đã tạo:
 
 ```python
 import h5py
-with h5py.File("/content/drive/MyDrive/VQAv2/features/train_features.h5", "r") as f:
-    print("Keys:", list(f.keys()))
-    print("Train features shape:", f["features"].shape)
-    # Kỳ vọng: (443757, 257, 1024)
+with h5py.File("/content/drive/MyDrive/blip2_project/data/cache/train_features.h5", "r") as f:
+    print(f"Số ảnh đã cache: {len(f.keys()):,}")
+    sample_key = list(f.keys())[0]
+    print(f"Shape mẫu [{sample_key}]: {f[sample_key].shape}")
+    # Kỳ vọng: (257, 1024) — 1 CLS + 256 patch tokens × dim 1024
 ```
 
 ---

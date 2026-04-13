@@ -84,7 +84,12 @@ class VQATrainer:
         log_every: int = 100,
         text_encoder: Optional[nn.Module] = None,
         wandb_run=None,
+        type_loss_weights: Optional[Dict[str, float]] = None,
     ) -> None:
+        # type_loss_weights: e.g. {"other": 2.0, "number": 1.2, "yes/no": 1.0}
+        # Per-batch samples của type có weight > 1.0 sẽ có loss được nhân thêm
+        # → gradient mạnh hơn cho "other" trong backprop.
+        # None (mặc định) = không dùng weighting, hoàn toàn backward-compat.
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -98,6 +103,7 @@ class VQATrainer:
         self.gradient_clip = gradient_clip
         self.eval_metric_fn = eval_metric_fn
         self.log_every = log_every
+        self.type_loss_weights: Optional[Dict[str, float]] = type_loss_weights
         # text_encoder (FrozenTextEncoder) dùng cho EXP fusion models (Phương án B).
         # Nếu None → dùng legacy BLIP2VQA pipeline (pixel_values + input_ids).
         self.text_encoder = text_encoder
@@ -346,6 +352,10 @@ class VQATrainer:
             → gọi ``model(visual_features, text_features)`` → tensor logits.
           - **Legacy BLIP2VQA pipeline** (khi ``self.text_encoder`` là None):
             Dùng ``KEY_PIXEL_VALUES`` + ``input_ids`` truyền thẳng vào model.
+
+        Nếu ``self.type_loss_weights`` được set, loss của mỗi sample sẽ được
+        nhân với weight tương ứng với answer_type của nó trước khi lấy mean.
+        Ví dụ ``{"other": 2.0}`` → gradient của "other" samples mạnh gấp đôi.
         """
         answer_scores = batch.get(KEY_ANSWER_SCORES)
         if answer_scores is not None:
@@ -378,7 +388,7 @@ class VQATrainer:
             targets = answer_scores if answer_scores is not None else answer_label
             if targets is None:
                 return torch.tensor(0.0, device=self.device, requires_grad=True)
-            return self.loss_fn(logits, targets)
+            return self._weighted_loss(logits, targets, batch)
 
         else:
             # --- Legacy BLIP2VQA pipeline ---
@@ -404,9 +414,75 @@ class VQATrainer:
                 targets = answer_scores if answer_scores is not None else answer_label
                 if targets is None:
                     return torch.tensor(0.0, device=self.device, requires_grad=True)
-                return self.loss_fn(out[KEY_LOGITS], targets)
+                return self._weighted_loss(out[KEY_LOGITS], targets, batch)
 
             return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+    def _weighted_loss(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        batch: Dict,
+    ) -> torch.Tensor:
+        """Tính loss với per-sample type weight nếu ``self.type_loss_weights`` được set.
+
+        Khi không có type_loss_weights, hoạt động giống hệt ``self.loss_fn(logits, targets)``
+        (không thêm overhead).
+
+        Per-sample weighting:
+            w[i] = type_loss_weights.get(answer_type[i], 1.0)
+            loss = (loss_per_sample * w).sum() / w.sum()   ← weighted mean
+
+        Dùng weighted mean (chia cho tổng w) thay vì mean thông thường để
+        giữ scale loss tương đương với unweighted — tránh LR cần tune lại.
+        """
+        if self.type_loss_weights is None:
+            return self.loss_fn(logits, targets)
+
+        answer_types = batch.get(KEY_ANSWER_TYPE)   # List[str] hoặc None
+        if answer_types is None:
+            return self.loss_fn(logits, targets)
+
+        # Tính per-sample weight vector [B]
+        weights = torch.tensor(
+            [self.type_loss_weights.get(t, 1.0) for t in answer_types],
+            dtype=logits.dtype,
+            device=logits.device,
+        )
+
+        # Tính per-sample loss (reduction="none" → [B]) rồi áp dụng weighted mean
+        from configs.contracts import LOSS_BCE, LOSS_FOCAL_BCE, LOSS_KL
+
+        loss_type = getattr(self.loss_fn, "loss_type", LOSS_BCE)
+
+        if loss_type in (LOSS_BCE, LOSS_FOCAL_BCE):
+            # Per-sample BCE loss: mean trên V → [B]
+            per_sample = torch.nn.functional.binary_cross_entropy_with_logits(
+                logits, targets.float(), reduction="none"
+            ).mean(dim=-1)  # [B]
+            if loss_type == LOSS_FOCAL_BCE:
+                gamma = getattr(self.loss_fn, "focal_gamma", 1.5)
+                probs = torch.sigmoid(logits)
+                p_t = probs * targets.float() + (1.0 - probs) * (1.0 - targets.float())
+                fw = ((1.0 - p_t) ** gamma).mean(dim=-1)  # [B]
+                per_sample = fw * per_sample
+        elif loss_type == LOSS_KL:
+            eps = 1e-8
+            tp = targets.float()
+            tp = tp / (tp.sum(dim=-1, keepdim=True) + eps)
+            per_sample = torch.nn.functional.kl_div(
+                torch.nn.functional.log_softmax(logits, dim=-1),
+                tp,
+                reduction="none",
+            ).sum(dim=-1)  # [B]
+        else:
+            # CE: per-sample cross-entropy → [B]
+            per_sample = torch.nn.functional.cross_entropy(
+                logits, targets, reduction="none"
+            )  # [B]
+
+        # Weighted mean: sum(w_i * loss_i) / sum(w_i)
+        return (per_sample * weights).sum() / weights.sum()
 
     @torch.no_grad()
     def _get_predictions(self, batch: Dict):

@@ -168,7 +168,17 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Pre-extract CLIP image features")
-    parser.add_argument("--data_root",   default="/content/drive/MyDrive/blip2_project/data")
+    parser.add_argument("--data_root",   default="/content/drive/MyDrive/blip2_project/data",
+                        help="Thư mục gốc chứa ảnh và annotation VQAv2.")
+    parser.add_argument("--output_dir",  default=None,
+                        help="Thư mục đích để lưu file HDF5 (mặc định: {data_root}/cache). "
+                             "Override hoàn toàn data_root/cache_dir.")
+    parser.add_argument("--vqav2_dir",   default="vqav2",
+                        help="Tên thư mục JSON annotation bên trong data_root.")
+    parser.add_argument("--coco_dir",    default="coco",
+                        help="Tên thư mục ảnh COCO bên trong data_root.")
+    parser.add_argument("--model",       default="openai/clip-vit-large-patch14",
+                        help="HuggingFace model id của CLIP vision encoder.")
     parser.add_argument("--split",       default="train", choices=["train", "val", "both"])
     parser.add_argument("--device",      default="cuda")
     parser.add_argument("--batch_size",  type=int, default=64)
@@ -178,14 +188,30 @@ if __name__ == "__main__":
                         help="Cap images for a smoke-test (e.g. --max_images 50)")
     args = parser.parse_args()
 
+    # --output_dir overrides data_root/cache_dir khi được truyền vào
+    # Nếu không truyền, dùng data_root/cache (hành vi cũ)
+    cache_dir_cfg = "cache"   # relative to data_root
+    if args.output_dir:
+        # Đặt data_root = output_dir, cache_dir = "" để pre_extract_features
+        # ghi thẳng vào output_dir (không thêm sub-dir)
+        # Trick: dùng os.path.dirname + basename
+        import os as _os
+        _abs = _os.path.abspath(args.output_dir)
+        _data_root_eff = _os.path.dirname(_abs)
+        cache_dir_cfg  = _os.path.basename(_abs)
+    else:
+        _data_root_eff = args.data_root
+
     cfg = OmegaConf.create({
         "data": {
-            "data_root": args.data_root,
-            "vqav2_dir": "vqav2", "coco_dir": "coco", "cache_dir": "cache",
+            "data_root": _data_root_eff,
+            "vqav2_dir": args.vqav2_dir,
+            "coco_dir":  args.coco_dir,
+            "cache_dir": cache_dir_cfg,
             "train_size": 50000, "val_size": 10000,
             "image_size": 224, "seed": 42, "batch_size": 32,
         },
-        "model": {"image_encoder": "openai/clip-vit-large-patch14", "query_dim": 768},
+        "model": {"image_encoder": args.model, "query_dim": 768},
     })
 
     splits = ["train", "val"] if args.split == "both" else [args.split]

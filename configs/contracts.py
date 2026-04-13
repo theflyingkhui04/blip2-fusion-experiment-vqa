@@ -444,10 +444,11 @@ MODE_CLASSIFY: str = "classify"
 VALID_MODES = frozenset({MODE_GENERATE, MODE_CLASSIFY})
 
 # Loss types for VQALoss
-LOSS_BCE: str = "bce"
-LOSS_CE:  str = "ce"
-LOSS_KL:  str = "kl"
-VALID_LOSS_TYPES = frozenset({LOSS_BCE, LOSS_CE, LOSS_KL})
+LOSS_BCE:       str = "bce"
+LOSS_CE:        str = "ce"
+LOSS_KL:        str = "kl"
+LOSS_FOCAL_BCE: str = "focal_bce"   # Focal BCE — upweights hard/uncertain examples
+VALID_LOSS_TYPES = frozenset({LOSS_BCE, LOSS_CE, LOSS_KL, LOSS_FOCAL_BCE})
 
 # Optimizer names
 OPTIM_ADAMW: str = "adamw"
