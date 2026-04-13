@@ -35,6 +35,7 @@ def pre_extract_features(
     batch_size: int = 64,
     checkpoint_interval: int = 10,
     max_images: int | None = None,
+    input_dir: str | None = None,
 ) -> None:
     """Run ViT-L/14 on all (or a capped subset of) COCO images and save to HDF5.
 
@@ -89,6 +90,20 @@ def pre_extract_features(
         if extra:
             print(f"  HDF5 has {len(extra):,} extra ids not in checkpoint — merging")
         done_ids |= h5_done
+
+    # ── Seed done_ids from a separate input_dir (cloned source) ──────────────
+    if input_dir is not None:
+        in_cache = os.path.join(input_dir, meta["cache"])
+        in_ckpt  = in_cache + ".ckpt.json"
+        if os.path.exists(in_ckpt):
+            with open(in_ckpt) as f:
+                done_ids |= set(json.load(f).get("done", []))
+            print(f"  Input ckpt: merged from {os.path.basename(in_ckpt)}")
+        if os.path.exists(in_cache):
+            with h5py.File(in_cache, "r") as h5f:
+                in_done = {int(k) for k in h5f.keys()}
+            print(f"  Input HDF5: {len(in_done):,} ids from {os.path.basename(in_cache)}")
+            done_ids |= in_done
 
     to_process = [iid for iid in image_ids if iid not in done_ids]
     print(f"  Already cached: {len(done_ids):,} | Remaining: {len(to_process):,}")
@@ -186,6 +201,10 @@ if __name__ == "__main__":
                         help="Flush + save checkpoint every N batches")
     parser.add_argument("--max_images",  type=int, default=None,
                         help="Cap images for a smoke-test (e.g. --max_images 50)")
+    parser.add_argument("--input_dir",   default=None,
+                        help="Thư mục chứa HDF5 đã extract sẵn (cloned source). "
+                             "Dùng để biết image nào đã xong, KHÔNG ghi vào đây. "
+                             "Kết hợp với --output_dir để extract tiếp mà ko động cái gốc.")
     args = parser.parse_args()
 
     # --output_dir overrides data_root/cache_dir khi được truyền vào
@@ -221,4 +240,5 @@ if __name__ == "__main__":
             batch_size=args.batch_size,
             checkpoint_interval=args.ckpt_every,
             max_images=args.max_images,
+            input_dir=args.input_dir,
         )
