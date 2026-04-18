@@ -1,35 +1,36 @@
-"""Pre-extract ViT-L/14 (CLIP) image features for all COCO 2014 images.
-Outputs: data/cache/train_features.h5 and val_features.h5
-         Key: str(image_id), Value: float16 array (257, 1024)
+"""Trích xuất trước các đặc trưng hình ảnh ViT-L/14 (CLIP) cho tất cả các hình ảnh COCO 2014.
+Đầu ra: data/cache/train_features.h5 và val_features.h5
+Khóa: str(image_id), Giá trị: mảng float16 (257, 1024)
+Chiến lược ghi an toàn (Colab + Google Drive FUSE)
+======================================================
+Ghi trực tiếp HDF5 vào Drive FUSE là KHÔNG AN TOÀN: HDF5 thực hiện ghi truy cập ngẫu nhiên
+(superblock ở byte 0 + dữ liệu ở cuối). Drive FUSE có thể ghi các thao tác này không theo thứ tự, dẫn đến superblock bị lỗi khi chương trình dừng hoạt động.
 
-Drive-safe write strategy (Colab + Google Drive FUSE)
-=====================================================
-Writing HDF5 directly to Drive FUSE is UNSAFE: HDF5 performs random-access
-writes (superblock at byte 0 + data at end). Drive FUSE may flush these out
-of order, leaving a corrupt superblock when the runtime dies.
+Chiến lược an toàn được sử dụng ở đây:
+1. TẤT CẢ các thao tác ghi H5 đều được ghi vào thư mục CỤC BỘ (/content/h5_cache) (mặc định).
+Ổ đĩa cục bộ là SSD tốc độ cao và tuân thủ POSIX — không liên quan đến FUSE.
 
-Safe strategy used here:
-  1. ALL H5 writes go to a LOCAL directory (/content/h5_cache by default).
-     Local disk is a fast SSD and POSIX-compliant — no FUSE involved.
-  2. At each checkpoint interval:
-       a. Flush + fsync local H5.
-       b. Verify local H5 has all expected keys.
-       c. Copy local H5 → Drive H5 (sequential write, FUSE handles OK).
-       d. Verify Drive H5 has expected keys.
-       e. Write checkpoint JSON to Drive (atomic rename).
-  3. If the Drive copy fails at any step, skip updating the checkpoint and
-     retry at the next interval — no data loss.
+2. Tại mỗi khoảng thời gian kiểm tra:
+a. ĐÓNG file H5 cục bộ (đảm bảo metadata + data đều flush xuống disk).
+b. Xác minh H5 cục bộ có tất cả các khóa dự kiến.
+c. Sao chép H5 cục bộ → Drive (ghi chunked → fsync → atomic rename).
+d. Xác minh kích thước file + số lượng key trên Drive.
+e. Ghi JSON điểm kiểm tra vào Drive (đổi tên nguyên tử).
+f. Mở lại H5 cục bộ để tiếp tục ghi.
 
-Resume strategy:
-  - On start: copy Drive H5 → local (if it exists and is valid).
-  - If Drive H5 is corrupted: warn, ignore it, start fresh locally.
-  - Checkpoint JSON + Drive H5 are always consistent.
+3. Nếu việc sao chép Drive thất bại ở bất kỳ bước nào, hãy bỏ qua việc cập nhật điểm kiểm tra và
+thử lại ở khoảng thời gian tiếp theo — không mất dữ liệu.
 
-Notes:
-  - Does NOT call text_encoder.py — BERT runs inside the trainer at
-    training time; pre-extraction only handles frozen ViT.
-  - Uses VQAv2Dataset.SPLIT_FILES for file/dir metadata.
-  - Pass max_images to cap images (useful for smoke-tests).
+Chiến lược tiếp tục:
+- Khi bắt đầu: sao chép Drive H5 → cục bộ (nếu tồn tại và hợp lệ).
+- Nếu Drive H5 bị hỏng: cảnh báo, bỏ qua, bắt đầu lại cục bộ.
+- JSON điểm kiểm tra + Drive H5 luôn nhất quán.
+
+Ghi chú:
+- KHÔNG gọi text_encoder.py — BERT chạy bên trong trình huấn luyện tại
+thời điểm huấn luyện; trích xuất trước chỉ xử lý ViT bị đóng băng.
+- Sử dụng VQAv2Dataset.SPLIT_FILES dùng để lấy siêu dữ liệu tệp/thư mục.
+- Truyền max_images để giới hạn số lượng ảnh (hữu ích cho các bài kiểm tra sơ bộ).
 """
 
 import json
@@ -109,33 +110,86 @@ def _sync_to_drive(
     drive_path: str,
     must_have_ids: set,
 ) -> bool:
-    """Copy local H5 → Drive H5 and verify. Returns True on success.
+    """Copy local H5 → Drive H5 via chunked write + atomic rename.
 
-    This is a plain sequential file copy — Drive FUSE handles sequential
-    writes reliably, unlike random-access H5 writes.
+    Fixes cho Google Drive FUSE:
+    1. Ghi vào file TẠM trên Drive (tránh overwrite partial).
+    2. Chunked read/write (64 MB) — tránh FUSE buffering issues.
+    3. fsync file tạm để buộc FUSE flush xuống storage.
+    4. os.replace() atomic để swap tmp → final.
+    5. os.sync() buộc TẤT CẢ FUSE pending writes flush xuống storage.
+    6. Verify kích thước file (bắt lỗi truncated upload mà FUSE cache giấu).
+    7. Verify H5 key count.
     """
+    local_size = os.path.getsize(local_path)
+    tmp_drive = drive_path + ".tmp_sync"
+
     try:
-        print(f"\n  Syncing to Drive ({os.path.getsize(local_path)/1e6:.1f} MB)…", end=" ", flush=True)
-        shutil.copy2(local_path, drive_path)
-        # Flush Drive FUSE page cache for this file
+        print(f"\n  Syncing to Drive ({local_size / 1e6:.1f} MB)…", end=" ", flush=True)
+
+        # Step 1: Chunked copy → temp file on Drive
+        chunk_size = 64 * 1024 * 1024  # 64 MB
+        with open(local_path, "rb") as fsrc, open(tmp_drive, "wb") as fdst:
+            while True:
+                chunk = fsrc.read(chunk_size)
+                if not chunk:
+                    break
+                fdst.write(chunk)
+            fdst.flush()
+            os.fsync(fdst.fileno())
+
+        # Step 2: Verify temp file size before rename
+        tmp_size = os.path.getsize(tmp_drive)
+        if tmp_size != local_size:
+            print(f"WARN — tmp size mismatch! local={local_size:,} tmp={tmp_size:,}")
+            try:
+                os.unlink(tmp_drive)
+            except OSError:
+                pass
+            return False
+
+        # Step 3: Atomic rename tmp → final
+        os.replace(tmp_drive, drive_path)
+
+        # Step 4: Force ALL pending FUSE writes to storage
+        try:
+            os.sync()
+        except AttributeError:
+            pass  # os.sync() not available on this platform (e.g. Windows)
+
+        # Step 5: Re-open and fsync the final file to be absolutely sure
         try:
             with open(drive_path, "rb") as fh:
                 os.fsync(fh.fileno())
         except OSError:
             pass
 
-        # Verify Drive copy has all required keys
-        drive_keys = _verify_h5_keys(drive_path)
-        missing = must_have_ids - drive_keys
-        if missing:
-            print(f"WARN — {len(missing):,} keys missing in Drive copy!")
+        # Step 6: File size verification (catches truncated uploads
+        # that FUSE page cache hides from h5py reads)
+        drive_size = os.path.getsize(drive_path)
+        if drive_size != local_size:
+            print(f"WARN — drive size mismatch! "
+                  f"local={local_size:,} drive={drive_size:,}")
             return False
 
-        print(f"OK ({len(drive_keys):,} keys on Drive) ✅")
+        # Step 7: H5 key verification
+        drive_keys = _verify_h5_keys(drive_path)
+        if len(must_have_ids) > 0 and len(drive_keys) < len(must_have_ids):
+            missing = must_have_ids - drive_keys
+            print(f"WARN — {len(missing):,} keys missing "
+                  f"(expected≥{len(must_have_ids):,}, got {len(drive_keys):,})")
+            return False
+
+        print(f"OK ({len(drive_keys):,} keys, "
+              f"{drive_size / 1e6:.1f} MB on Drive) ✅")
         return True
 
     except Exception as exc:
         print(f"FAILED: {exc}")
+        try:
+            os.unlink(tmp_drive)
+        except OSError:
+            pass
         return False
 
 
@@ -294,7 +348,12 @@ def pre_extract_features(
     pending_ids:    list = []   # written to local H5, not yet synced to Drive
     pending_missing: list = []  # image files absent — safe to checkpoint w/o H5
 
-    with h5py.File(local_cache_path, "a") as h5f:
+    # NOTE: Không dùng `with h5py.File(...)` vì cần ĐÓNG file trước mỗi lần
+    # sync lên Drive. h5py.flush() KHÔNG đảm bảo file consistent trên disk —
+    # chỉ có close() mới đảm bảo metadata HDF5 (superblock, B-tree) được ghi
+    # đầy đủ. Đây là nguyên nhân shutil.copy2 tạo ra file bị truncate.
+    h5f = h5py.File(local_cache_path, "a")
+    try:
         pbar = tqdm(
             range(0, len(to_process), batch_size),
             total=n_batches,
@@ -340,11 +399,14 @@ def pre_extract_features(
             pending_ids.extend(written_this_batch)
             saved_this_run += len(written_this_batch)
 
-            # ── Checkpoint: local flush → Drive copy → verify → JSON ──────────
+            # ── Checkpoint: close H5 → verify → Drive copy → JSON → reopen ──
             if (batch_num + 1) % checkpoint_interval == 0:
-                _flush_and_fsync(h5f)
+                # CLOSE H5 to finalize ALL internal metadata + data blocks.
+                # h5py.flush() alone does NOT guarantee a consistent file —
+                # only close() writes the final superblock + B-tree indices.
+                h5f.close()
 
-                # Verify local H5 first
+                # Verify local H5 (file is now fully consistent on disk)
                 local_verified = _verify_h5_keys(local_cache_path)
                 unverified_local = set(pending_ids) - local_verified
                 if unverified_local:
@@ -352,10 +414,13 @@ def pre_extract_features(
                           f"— will retry.")
                     pending_ids = [x for x in pending_ids if x not in unverified_local]
 
-                # Sync local → Drive (sequential copy, FUSE-safe)
-                all_ids_to_commit = set(pending_ids) | set(pending_missing)
-                expected_on_drive = done_ids | set(pending_ids)
-                sync_ok = _sync_to_drive(local_cache_path, cache_path, expected_on_drive)
+                # Sync local → Drive.
+                # FIX BUG: Dùng local_verified (actual H5 keys) để verify,
+                # KHÔNG dùng done_ids vì done_ids chứa ghost IDs (missing
+                # images) — những ID này không bao giờ nằm trong file H5.
+                sync_ok = _sync_to_drive(
+                    local_cache_path, cache_path, local_verified
+                )
 
                 if sync_ok:
                     done_ids.update(pending_ids)
@@ -368,24 +433,37 @@ def pre_extract_features(
 
                 pbar.set_postfix(saved=saved_this_run, on_drive=len(done_ids))
 
-        # ── Final sync ────────────────────────────────────────────────────────
-        _flush_and_fsync(h5f)
+                # Reopen H5 for the next batch of writes
+                h5f = h5py.File(local_cache_path, "a")
 
+    finally:
+        # Ensure H5 file is always closed, even on unhandled exceptions
+        try:
+            if h5f.id.valid:
+                h5f.close()
+        except Exception:
+            pass
+
+    # ── Final sync (H5 is closed — file is fully consistent) ──────────────
+    local_verified = _verify_h5_keys(local_cache_path)
+
+    if pending_ids or pending_missing:
         if pending_ids:
-            local_verified = _verify_h5_keys(local_cache_path)
             unverified = set(pending_ids) - local_verified
             if unverified:
-                print(f"\n  [WARN] Final: {len(unverified):,} ids not in local H5 — will retry.")
+                print(f"\n  [WARN] Final: {len(unverified):,} ids not in local H5 — dropping.")
                 pending_ids = [x for x in pending_ids if x not in unverified]
 
-        expected_final = done_ids | set(pending_ids)
-        sync_ok = _sync_to_drive(local_cache_path, cache_path, expected_final)
+        # FIX BUG: Dùng local_verified thay vì done_ids | set(pending_ids)
+        sync_ok = _sync_to_drive(local_cache_path, cache_path, local_verified)
         if sync_ok:
             done_ids.update(pending_ids)
             done_ids.update(pending_missing)
             _write_checkpoint_atomic(ckpt_path, done_ids)
         else:
             print("[ERROR] Final Drive sync FAILED — run again to retry remaining images.")
+    else:
+        print("  All data synced at last checkpoint — no final sync needed.")
 
     # ── Post-run report ───────────────────────────────────────────────────────
     print(f"\n{'='*60}")

@@ -21,29 +21,32 @@ from configs.contracts import (
 class VQALoss(nn.Module):
     """Hàm loss kết hợp cho các thí nghiệm VQA.
 
-    Hỗ trợ bốn mục tiêu huấn luyện:
+    Có bốn hàm loss huấn luyện:
 
-    * **Soft-target BCE** (``"bce"``): binary cross-entropy so với soft scores
-      của từng đáp án, được tính từ annotation VQA (``min(count / 3, 1)``).
+    * Soft-target BCE: binary cross-entropy so với soft scores
+      của từng đáp án, được tính từ annotation VQA (min(count / 3, 1)).
       Thường dùng khi huấn luyện với bộ answer vocabulary cố định.
-    * **Cross-entropy** (``"ce"``): cross-entropy đa lớp chuẩn so với một
+    
+    * Cross-entropy: cross-entropy đa lớp chuẩn so với một
       hard label duy nhất. Phù hợp khi fine-tune generative decoder.
-    * **KL divergence** (``"kl"``): coi soft scores như một phân phối xác
+
+    * KL divergence: coi soft scores như một phân phối xác
       suất hợp lệ và tối thiểu hoá KL divergence.
-    * **Focal BCE** (``"focal_bce"``): biến thể BCE với focal weighting
-      ``(1 - p_t)^gamma`` — giảm ảnh hưởng của các answers dễ (yes/no) và
+
+    * Focal BCE: biến thể BCE với focal weighting
+      (1 - p_t)^gamma — giảm ảnh hưởng của các answers dễ (yes/no) và
       tập trung gradient vào các answers khó (open-ended "other").
       Đặc biệt hiệu quả khi "other" accuracy thấp do soft targets thưa.
 
     Args:
-        loss_type: Một trong ``"bce"``, ``"ce"``, ``"kl"``, ``"focal_bce"``.
-        label_smoothing: Label smoothing cho loss ``"ce"`` (0.0 = tắt).
-        reduction: ``"mean"`` hoặc ``"sum"``.
-        focal_gamma: Exponent của focal weight ``(1-p_t)^gamma``.
-            Chỉ có hiệu lực khi ``loss_type="focal_bce"``.
+        loss_type: Một trong bce, ce, kl, focal_bce.
+        label_smoothing: Label smoothing cho loss ce (0.0 = tắt).
+        reduction: mean hoặc sum.
+        focal_gamma: Exponent của focal weight (1-p_t)^gamma.
+            Chỉ có hiệu lực khi loss_type=focal_bce.
             Giá trị thường dùng: 1.0–2.0 (mặc định 1.5).
         focal_alpha: Trọng số balance positive/negative trong Focal BCE.
-            ``None`` = không dùng alpha weighting (mặc định).
+            None = không dùng alpha weighting (mặc định).
     """
 
     def __init__(
@@ -71,8 +74,6 @@ class VQALoss(nn.Module):
                 reduction=reduction,
             )
 
-    # ------------------------------------------------------------------
-
     def forward(
         self,
         logits: torch.Tensor,
@@ -82,11 +83,11 @@ class VQALoss(nn.Module):
 
         Args:
             logits: Logits đầu ra của mô hình.
-                Shape ``[B, num_answers]`` cho ``"bce"`` / ``"kl"`` và ``"ce"``.
+                Shape [B, num_answers] cho bce / kl và ce.
             labels: Nhãn ground-truth.
-                * Với ``"bce"`` / ``"kl"``: soft score tensor ``[B, num_answers]``
-                  có giá trị trong khoảng ``[0, 1]``.
-                * Với ``"ce"``: long integer tensor ``[B]`` chứa chỉ số class.
+                * Với bce / kl: soft score tensor [B, num_answers]
+                  có giá trị trong khoảng [0, 1].
+                * Với ce: long integer tensor [B] chứa chỉ số class.
 
         Returns:
             Scalar loss tensor.
@@ -132,7 +133,7 @@ class GenerativeLoss(nn.Module):
 
     Bọc :class:`torch.nn.CrossEntropyLoss` với label smoothing tuỳ chọn và
     bỏ qua các vị trí padding mặc định
-    (``ignore_index=LABEL_IGNORE_INDEX`` = ``-100``).
+    (ignore_index=LABEL_IGNORE_INDEX = -100).
 
     Args:
         ignore_index: Token id bị bỏ qua khi tính loss.
@@ -158,9 +159,9 @@ class GenerativeLoss(nn.Module):
         """Tính cross-entropy loss cho sequence generation.
 
         Args:
-            logits: ``[B, L, vocab_size]`` — logits của từng bước thời gian.
-            labels: ``[B, L]`` — token id nguyên; vị trí padding phải được
-                đặt thành ``ignore_index`` (mặc định ``-100``).
+            logits: [B, L, vocab_size] — logits của từng bước thời gian.
+            labels: [B, L] — token id nguyên; vị trí padding phải được
+                đặt thành ignore_index (mặc định -100).
 
         Returns:
             Scalar loss.
