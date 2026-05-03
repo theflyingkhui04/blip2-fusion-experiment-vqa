@@ -1,211 +1,272 @@
 """
-contracts.py — Unified I/O contracts for the BLIP-2 VQA experiment repo.
+contracts.py — Quy uoc I/O chung cho toan bo repo BLIP-2 VQA.
 
-PURPOSE
--------
-This file is the single source of truth for every tensor shape, dictionary key,
-and type that crosses a module boundary.  Any code (model, dataset, trainer,
-evaluation) that produces or consumes structured data MUST conform to the
-TypedDicts and constants defined here.
+MUC DICH
+File nay la nguon chan ly duy nhat (single source of truth) cho moi:
+    - Ten bien (key) trong batch dict
+    - Kieu du lieu va shape cua Tensor
+    - Hang so duoc dung chung giua cac module
 
-RULE: if you add a new key to a batch, a model output, or a prediction record,
-you add it here first, then implement it everywhere else.
+QUY TAC BAT BUOC
+Neu ban them key moi vao batch, model output, hoac prediction:
+    1. Dinh nghia key/hang so tai day TRUOC
+    2. Sau do moi implement o cac file khac
 
-CONTENTS
---------
-1.  Canonical key constants          – string literals re-used across modules.
-2.  Batch contract (DataLoader out)  – VQABatch
-3.  Model output contracts           – ModelOutput, GenerateOutput
-4.  Prediction record contract       – PredictionRecord
-5.  Evaluation output contract       – EvalResult
-6.  Checkpoint contract              – CheckpointDict
-7.  Config sub-contracts             – ModelConfig, DataConfig, TrainingConfig,
-                                       OptimizerConfig, SchedulerConfig, LoggingConfig
-8.  Fusion model contracts           – FusionInput, FusionOutput
-9.  Runtime constants                – ANSWER_VOCAB_SIZE, IMAGE_SIZE, …
+NOI DUNG
+    1. Hang so ten bien (batch key, checkpoint key, eval key...)
+    2. VQABatch        — cau truc du lieu tra ra tu DataLoader
+    3. ModelOutput     — cau truc du lieu tra ra tu model.forward()
+    4. GenerateOutput  — cau truc du lieu tra ra tu model.generate_answers()
+    5. PredictionRecord — mot dong du doan (de truyen vao VQAEvaluator)
+    6. EvalResult      — ket qua danh gia tra ra tu trainer.evaluate()
+    7. CheckpointDict  — cau truc file checkpoint .pth
+    8. Config classes  — tuong ung tung block trong file YAML
+    9. FusionInput / FusionOutput — hop dong I/O cho cac fusion model EXP-01..07
+    10. Hang so runtime — kich thuoc vocab, dim tensor, ten model...
 """
 
 from __future__ import annotations
 
 from typing import List, Optional
 
-# ---------------------------------------------------------------------------
-# mypy / runtime-safe TypedDict (works on Python 3.8+)
-# ---------------------------------------------------------------------------
+# Tuong thich Python 3.8+; neu Python 3.7 thi fallback sang typing_extensions
 try:
     from typing import TypedDict, Literal
-except ImportError:  # Python 3.7 fallback
+except ImportError:
     from typing_extensions import TypedDict, Literal  # type: ignore[assignment]
 
 import torch
 
-# ===========================================================================
-# 1. Canonical key constants
-# ===========================================================================
-# Use these constants instead of bare string literals so that a typo becomes
-# a NameError instead of a silent bug.
 
-# ── Batch keys ──────────────────────────────────────────────────────────────
-KEY_PIXEL_VALUES    = "pixel_values"       # torch.Tensor [B, 3, H, W] float32
-KEY_IMAGE_FEATURES  = "image_features"     # torch.Tensor [B, N_tokens, CLIP_DIM] float32 (pre-extracted)
-KEY_INPUT_IDS       = "input_ids"          # torch.Tensor [B, L]       int64  (tokenized question)
-KEY_ATTENTION_MASK  = "attention_mask"     # torch.Tensor [B, L]       int64 0/1
-KEY_ANSWER_SCORES   = "answer_scores"      # torch.Tensor [B, V]       float32  ∈ [0,1]
-KEY_ANSWER_LABEL    = "answer_label"       # torch.Tensor [B]          int64  (hard label index, -1 = OOV)
-KEY_LABELS          = "labels"             # torch.Tensor [B, L]       int64   (-100 = ignore)
-KEY_QUESTION_IDS    = "question_ids"       # List[int]   — VQAv2 question_id for each sample
-KEY_QUESTION_TEXT   = "question_text"      # List[str]   — raw question strings
-KEY_IMAGE_IDS       = "image_ids"          # List[int]   — COCO image_id for each sample
-KEY_ANSWER_TEXT     = "answer"             # List[str]   — most common answer string (singular)
-KEY_ANSWERS         = "answers"            # List[List[str]] — all 10 raw answer strings
-KEY_ANSWER_TYPE     = "answer_type"        # List[str]   — "yes/no" | "number" | "other"
+# =============================================================================
+# 1. Hang so ten bien
+#
+# Dung hang so thay vi viet chuoi truc tiep (vd: batch["image_features"])
+# de neu go sai ten thi Python bao NameError ngay — thay vi bug am tham.
+# =============================================================================
 
-# ── Model output keys ────────────────────────────────────────────────────────
-KEY_LOSS            = "loss"               # torch.Tensor scalar
-KEY_LOGITS          = "logits"             # torch.Tensor [B, V]       float32 (classify)
-                                           #           or [B, L, vocab] float32 (generate)
-KEY_VISUAL_FEATURES = "visual_features"    # torch.Tensor [B, D]       float32
+# Ten bien trong batch (output cua DataLoader)
+KEY_PIXEL_VALUES    = "pixel_values"
+# Tensor anh goc: [B, 3, H, W] float32 — dung khi khong co cache HDF5
 
-# ── Prediction / evaluation keys ────────────────────────────────────────────
-KEY_QUESTION_ID     = "question_id"        # int
-KEY_ANSWER          = "answer"             # str  (predicted answer string)
+KEY_IMAGE_FEATURES  = "image_features"
+# Tensor dac trung anh da trich xuat: [B, 257, 1024] float32
+# (1 CLS token + 256 patch tokens tu CLIP ViT-L/14)
+# Chi co khi use_cache=True
 
-# ── Checkpoint keys ─────────────────────────────────────────────────────────
-KEY_EPOCH           = "epoch"              # int
-KEY_GLOBAL_STEP     = "global_step"        # int
-KEY_MODEL_STATE     = "model_state_dict"   # OrderedDict
+KEY_INPUT_IDS       = "input_ids"
+# Tensor ID token cau hoi (sau khi tokenize bang BERT): [B, 50] int64
+
+KEY_ATTENTION_MASK  = "attention_mask"
+# Mask cho padding: [B, 50] int64, gia tri 0 (padding) hoac 1 (token that)
+
+KEY_ANSWER_SCORES   = "answer_scores"
+# Soft label cua cau tra loi: [B, 3129] float32, gia tri trong [0, 1]
+# Cong thuc: score = min(so_nguoi_chon / 3, 1.0)
+
+KEY_ANSWER_LABEL    = "answer_label"
+# Hard label: [B] int64 — index cua cau tra loi pho bien nhat
+# -1 neu cau tra loi khong nam trong vocab (OOV)
+
+KEY_LABELS          = "labels"
+# Tensor label cho huan luyen generative: [B, L] int64
+# Vi tri bi ignore = -100 (tieu chuan PyTorch)
+
+KEY_QUESTION_IDS    = "question_ids"
+# List[int] — ID cau hoi trong VQAv2, dung khi danh gia chinh thuc
+
+KEY_QUESTION_TEXT   = "question_text"
+# List[str] — Chuoi cau hoi goc (chua qua tokenize)
+
+KEY_IMAGE_IDS       = "image_ids"
+# List[int] — ID anh COCO tuong ung voi tung mau trong batch
+
+KEY_ANSWER_TEXT     = "answer"
+# List[str] — Cau tra loi pho bien nhat (mot chuoi duy nhat)
+
+KEY_ANSWERS         = "answers"
+# List[List[str]] — Toan bo 10 cau tra loi cua 10 nguoi chu thich
+
+KEY_ANSWER_TYPE     = "answer_type"
+# List[str] — Loai cau hoi: "yes/no" | "number" | "other"
+
+# Ten bien trong output cua model
+KEY_LOSS            = "loss"
+# Tensor scalar — gia tri loss cua batch hien tai
+
+KEY_LOGITS          = "logits"
+# Tensor logit chua qua softmax:
+#   classify mode: [B, 3129] float32
+#   generate mode: [B, seq_len, lm_vocab] float32
+
+KEY_VISUAL_FEATURES = "visual_features"
+# Tensor dac trung anh sau khi qua fusion module: [B, D] float32
+
+# Ten bien cho ket qua du doan va danh gia
+KEY_QUESTION_ID     = "question_id"
+# int — ID cua mot cau hoi cu the (dung trong PredictionRecord)
+
+KEY_ANSWER          = "answer"
+# str — Cau tra loi duoc du doan (mot chuoi)
+
+# Ten bien trong file checkpoint .pth
+KEY_EPOCH           = "epoch"
+# int — Epoch tai thoi diem luu checkpoint
+
+KEY_GLOBAL_STEP     = "global_step"
+# int — Tong so buoc optimizer da chay
+
+KEY_MODEL_STATE     = "model_state_dict"
+# OrderedDict — ket qua cua model.state_dict()
+
 KEY_OPTIM_STATE     = "optimizer_state_dict"
+# dict — ket qua cua optimizer.state_dict()
+
 KEY_SCHED_STATE     = "scheduler_state_dict"
-KEY_BEST_VAL_METRIC = "best_val_metric"    # float
-KEY_CONFIG          = "config"             # dict (full YAML config)
+# dict — ket qua cua scheduler.state_dict()
 
-# ── Evaluation result keys ───────────────────────────────────────────────────
-KEY_OVERALL_ACC     = "overall"            # float  VQA accuracy 0-1
-KEY_YESNO_ACC       = "yes/no"             # float
-KEY_NUMBER_ACC      = "number"             # float
-KEY_OTHER_ACC       = "other"              # float
+KEY_BEST_VAL_METRIC = "best_val_metric"
+# float — gia tri metric tot nhat tu truoc den gio (dung de luu best_model.pth)
+
+KEY_CONFIG          = "config"
+# dict — toan bo config YAML tai thoi diem train
+
+# Ten bien trong EvalResult
+KEY_OVERALL_ACC     = "overall"
+# float — accuracy toan bo (khong phan loai cau hoi)
+
+KEY_YESNO_ACC       = "yes/no"
+# float — accuracy rieng cho cau hoi Yes/No (~38% tap val)
+
+KEY_NUMBER_ACC      = "number"
+# float — accuracy rieng cho cau hoi dem so (~12% tap val)
+
+KEY_OTHER_ACC       = "other"
+# float — accuracy rieng cho cau hoi mo (~50% tap val)
 
 
-# ===========================================================================
-# 2. Batch contract  (output of DataLoader / VQADataset.__getitem__)
-# ===========================================================================
+# =============================================================================
+# 2. VQABatch — Cau truc du lieu tra ra tu DataLoader
+#
+# TypedDict giup IDE va type checker biet chinh xac cac key nao co trong batch.
+# total=False: tat ca cac truong deu la "co the vang mat" —
+#   vi batch train co answer_scores nhung batch test thi khong.
+# =============================================================================
 
 class VQABatch(TypedDict, total=False):
-    """Structured batch produced by :class:`data.vqa_dataset.VQADataset`.
+    """
+    Cau truc batch du lieu tra ra tu VQADataset.__getitem__() va DataLoader.
 
-    Mandatory fields (``total=False`` so optional fields don't break older
-    code, but the fields below marked ★ are always present):
+    Truong luon co mat (trong ca train va val):
+        pixel_values   HOAC image_features  (mot trong hai, tuy use_cache)
+        input_ids
+        attention_mask
+        question_ids
 
-    ★ pixel_values   : torch.Tensor  shape [B, 3, IMAGE_SIZE, IMAGE_SIZE], float32
-                       Pre-processed image tensor (normalized with ImageNet stats).
-    ★ input_ids      : torch.Tensor  shape [B, MAX_QUESTION_LENGTH], int64
-                       Tokenised question padded / truncated to MAX_QUESTION_LENGTH.
-    ★ attention_mask : torch.Tensor  shape [B, MAX_QUESTION_LENGTH], int64, values {0, 1}
-                       0 = padding, 1 = real token.
-    ★ question_ids   : List[int]     length B
-                       VQAv2 question_id for each sample.
-      question_text  : List[str]     length B
-                       Raw question strings (present in eval mode).
-      image_ids      : List[int]     length B
-                       COCO image_id for each sample.
-      answer_scores  : torch.Tensor  shape [B, ANSWER_VOCAB_SIZE], float32 ∈ [0, 1]
-                       Soft answer scores: min(human_count / 3, 1.0).
-                       Only present when annotation file is provided (train / val).
-      labels         : torch.Tensor  shape [B, MAX_QUESTION_LENGTH], int64
-                       Token ids for teacher-forcing; positions to ignore = -100.
-                       Only present in generative training.
+    Truong chi co khi co annotation (train / val, khong co o test):
+        answer_scores, answer_label, answer, answers, answer_type
+
+    Truong chi co khi huan luyen theo kieu generative:
+        labels
     """
 
-    # ── Image (exactly one of the two will be present per batch) ──────────────
-    pixel_values:   torch.Tensor    # [B, 3, IMAGE_SIZE, IMAGE_SIZE]   when use_cache=False
-    image_features: torch.Tensor    # [B, CLIP_PATCH_TOKENS, CLIP_DIM] when use_cache=True
-    # ── Question ────────────────────────────────────────────────────────────────
-    input_ids:      torch.Tensor    # [B, MAX_QUESTION_LENGTH]  tokenized
-    attention_mask: torch.Tensor    # [B, MAX_QUESTION_LENGTH]
-    question_ids:   List[int]       # VQAv2 question_id
-    question_text:  List[str]       # raw question strings
-    image_ids:      List[int]       # COCO image_id
-    # ── Answer (absent on test split) ───────────────────────────────────────────
-    answer_scores:  torch.Tensor    # [B, ANSWER_VOCAB_SIZE]  soft targets ∈ [0,1]
-    answer_label:   torch.Tensor    # [B]  hard label index (-1 = OOV)
-    answer:         List            # List[str]  most common answer
-    answers:        List            # List[List[str]]  all 10 answers
-    answer_type:    List            # List[str]  "yes/no"|"number"|"other"
-    labels:         torch.Tensor    # [B, L]  for generative training only
+    # Anh — chi co mot trong hai tuy che do
+    pixel_values:   torch.Tensor    # [B, 3, IMAGE_SIZE, IMAGE_SIZE] — anh goc
+    image_features: torch.Tensor    # [B, 257, 1024] — dac trung CLIP da trich xuat
+
+    # Cau hoi
+    input_ids:      torch.Tensor    # [B, 50] — token ID sau khi tokenize
+    attention_mask: torch.Tensor    # [B, 50] — mask padding
+    question_ids:   List[int]       # ID cau hoi VQAv2
+    question_text:  List[str]       # Chuoi cau hoi goc
+    image_ids:      List[int]       # ID anh COCO
+
+    # Cau tra loi (vang mat o tap test)
+    answer_scores:  torch.Tensor    # [B, 3129] — soft label tu 10 nguoi chu thich
+    answer_label:   torch.Tensor    # [B] — hard label (index cau tra loi pho bien nhat)
+    answer:         List            # List[str] — cau tra loi pho bien nhat
+    answers:        List            # List[List[str]] — toan bo 10 cau tra loi
+    answer_type:    List            # List[str] — "yes/no" | "number" | "other"
+
+    # Chi dung cho huan luyen generative
+    labels:         torch.Tensor    # [B, L] — teacher-forcing labels, -100 = ignore
 
 
-# ===========================================================================
+# =============================================================================
 # 3. Model output contracts
-# ===========================================================================
+#
+# ModelOutput: tra ra tu BLIP2VQA.forward()
+# GenerateOutput: tra ra tu BLIP2VQA.generate_answers()
+# =============================================================================
 
 class ModelOutput(TypedDict, total=False):
-    """Dictionary returned by :meth:`models.blip2_vqa.BLIP2VQA.forward`.
+    """
+    Dict tra ra tu BLIP2VQA.forward().
 
-    Mode "classify"
-    ---------------
-    ★ logits          : torch.Tensor  [B, ANSWER_VOCAB_SIZE], float32 (raw logits)
-      loss            : torch.Tensor  scalar  (only when answer_scores provided)
-      visual_features : torch.Tensor  [B, HIDDEN_SIZE], float32  (Q-Former mean pool)
+    Che do classify (dung cho EXP-01 den EXP-07):
+        logits          : [B, 3129] — logit chua qua softmax
+        loss            : scalar    — chi co khi truyen vao answer_scores
+        visual_features : [B, 768]  — dac trung anh sau Q-Former (mean pool)
 
-    Mode "generate"
-    ---------------
-    ★ logits          : torch.Tensor  [B, SEQ_LEN, LM_VOCAB_SIZE], float32
-      loss            : torch.Tensor  scalar  (only when labels provided)
-
-    ★ = always present in that mode.
+    Che do generate:
+        logits : [B, seq_len, lm_vocab] — logit cua language model
+        loss   : scalar                 — chi co khi truyen vao labels
     """
 
-    loss:            torch.Tensor
-    logits:          torch.Tensor
-    visual_features: torch.Tensor
+    loss:            torch.Tensor   # gia tri loss (scalar)
+    logits:          torch.Tensor   # logit chinh cua model
+    visual_features: torch.Tensor   # dac trung trung gian (tuy chon)
 
 
 class GenerateOutput(TypedDict):
-    """Return type of :meth:`models.blip2_vqa.BLIP2VQA.generate_answers`.
+    """
+    Dict tra ra tu BLIP2VQA.generate_answers() — mot batch.
 
-    Produced per-batch; the caller should collect and flatten over batches.
-
-    question_ids : List[int]  — VQAv2 question ids (same order as input)
-    answers      : List[str]  — decoded answer strings (post-processed, lowercased)
+    question_ids : List[int] — ID cua tung cau hoi trong batch
+    answers      : List[str] — Cau tra loi da giai ma (lowercase, normalized)
     """
 
     question_ids: List[int]
     answers:      List[str]
 
 
-# ===========================================================================
-# 4. Prediction record  (one element in the predictions list)
-# ===========================================================================
+# =============================================================================
+# 4. PredictionRecord — Mot dong du doan de truyen vao VQAEvaluator
+# =============================================================================
 
 class PredictionRecord(TypedDict):
-    """One prediction entry passed to :meth:`evaluation.vqa_eval.VQAEvaluator.compute_accuracy`.
+    """
+    Mot ban ghi du doan — element trong list predictions
+    duoc truyen vao VQAEvaluator.compute_accuracy().
 
-    question_id : int — VQAv2 question_id.
-    answer      : str — Predicted answer string.  Must be the *raw* model
-                        output before normalisation; :class:`VQAEvaluator`
-                        applies ``normalize_answer`` internally.
+    question_id : ID cau hoi VQAv2
+    answer      : Chuoi cau tra loi du doan (chua normalize —
+                  VQAEvaluator se tu normalize khi tinh accuracy)
     """
 
     question_id: int
     answer:      str
 
 
-# ===========================================================================
-# 5. Evaluation output contract
-# ===========================================================================
+# =============================================================================
+# 5. EvalResult — Ket qua danh gia
+#
+# Tra ra tu VQAEvaluator.compute_accuracy() va VQATrainer.evaluate().
+# total=False vi khong phai luc nao cung co du cac truong
+# (vd: khi khong co annotation thi khong co overall/yes_no/number/other).
+# =============================================================================
 
 class EvalResult(TypedDict, total=False):
-    """Dictionary returned by :meth:`evaluation.vqa_eval.VQAEvaluator.compute_accuracy`
-    and by :meth:`training.trainer.VQATrainer.evaluate`.
+    """
+    Dict ket qua danh gia.
 
-    ★ overall  : float  — Mean VQA accuracy over all questions (0.0 – 1.0 scale,
-                           i.e. NOT percentage).
-      yes/no   : float  — Accuracy for yes/no question type.
-      number   : float  — Accuracy for number question type.
-      other    : float  — Accuracy for all other question types.
-      loss     : float  — Validation loss (average over batches).
-      metric   : float  — Primary scalar metric used for checkpoint selection;
-                           equals ``overall`` when available, else ``-loss``.
+    overall : accuracy tong — thang do chinh, tu 0.0 den 1.0 (khong phai %)
+    yes/no  : accuracy cho cau hoi Yes/No
+    number  : accuracy cho cau hoi dem so
+    other   : accuracy cho cau hoi mo
+    loss    : val loss trung binh tren toan bo tap val
+    metric  : gia tri scalar chinh de chon best checkpoint
+              (= overall neu co, nguoc lai = -loss)
     """
 
     overall: float
@@ -216,215 +277,234 @@ class EvalResult(TypedDict, total=False):
     metric:  float
 
 
-# ===========================================================================
-# 6. Checkpoint contract
-# ===========================================================================
+# =============================================================================
+# 6. CheckpointDict — Cau truc file checkpoint .pth
+#
+# Moi file checkpoint duoc luu bang torch.save() phai co dung cac key nay.
+# =============================================================================
 
 class CheckpointDict(TypedDict, total=False):
-    """Schema for ``.pth`` checkpoint files saved by
-    :meth:`training.trainer.VQATrainer._save_checkpoint`.
+    """
+    Cau truc dict ben trong file checkpoint .pth.
 
-    ★ epoch                  : int
-    ★ global_step            : int
-    ★ model_state_dict       : dict  — output of ``model.state_dict()``
-    ★ optimizer_state_dict   : dict  — output of ``optimizer.state_dict()``
-    ★ best_val_metric        : float
-    ★ config                 : dict  — full YAML config dict
-      scheduler_state_dict   : dict  — output of ``scheduler.state_dict()``
-                                        (absent when no scheduler is used)
+    Truong bat buoc (luon co mat):
+        epoch, global_step, model_state_dict,
+        optimizer_state_dict, best_val_metric, config
+
+    Truong tuy chon:
+        scheduler_state_dict — vang mat neu khong dung scheduler
     """
 
-    epoch:                 int
-    global_step:           int
-    model_state_dict:      dict
-    optimizer_state_dict:  dict
-    best_val_metric:       float
-    config:                dict
-    scheduler_state_dict:  dict
+    epoch:                 int    # epoch tai thoi diem luu
+    global_step:           int    # tong so buoc optimizer
+    model_state_dict:      dict   # trong so model (tu model.state_dict())
+    optimizer_state_dict:  dict   # trang thai optimizer
+    best_val_metric:       float  # metric tot nhat de so sanh
+    config:                dict   # toan bo config YAML
+    scheduler_state_dict:  dict   # trang thai scheduler (neu co)
 
 
-# ===========================================================================
-# 7. Config sub-contracts  (mirrors default.yaml structure)
-# ===========================================================================
+# =============================================================================
+# 7. Config sub-contracts — Tuong ung tung block trong file YAML
+#
+# Cac class nay mo ta dung cau truc cua dict cfg["model"], cfg["data"]...
+# Giup IDE tu dong goi y khi truy cap config.
+# =============================================================================
 
 class ModelConfig(TypedDict, total=False):
-    """``cfg["model"]`` block in default.yaml."""
+    """
+    Block cfg["model"] trong file YAML (default.yaml / expXX.yaml).
 
-    name:               str    # "blip2_vqa"
-                               # | "mean_linear"        (EXP-01)
-                               # | "concat_fusion"       (EXP-02)
-                               # | "mlb_fusion"          (EXP-03)
-                               # | "mfb_fusion"          (EXP-04)
-                               # | "cross_attn_fusion"   (EXP-05)
-                               # | "qformer_scratch"     (EXP-06)
-                               # | "perceiver_resampler" (EXP-07)
-    blip2_model_name:   str    # HuggingFace model id, e.g. "Salesforce/blip2-opt-2.7b"
-    num_query_tokens:   int    # Q-Former query token count (default 32)
-    vision_width:       int    # ViT output dim (default 1408 for EVA-CLIP ViT-g)
-    hidden_size:        int    # Q-Former hidden dim (default 768)
-    num_layers:         int    # Q-Former transformer layers (default 12)
-    num_heads:          int    # Attention heads (default 12)
-    intermediate_size:  int    # FFN intermediate dim (default 3072)
-    dropout:            float  # Dropout probability (default 0.1)
-    max_answer_length:  int    # Max new tokens in generate mode (default 10)
-    fusion_output_size: int    # Hidden size for fusion baselines (default 1024)
-    num_answers:        int    # Answer vocab size (default 3129 for VQAv2)
-    mode:               str    # "generate" | "classify"
+    Truong name chon model nao se duoc dung:
+        "blip2_vqa"          — BLIP-2 pretrained (legacy)
+        "mean_linear"        — EXP-01: Mean Pool + Linear
+        "concat_fusion"      — EXP-02: Concat + MLP
+        "mlb_fusion"         — EXP-03: Hadamard Bilinear
+        "mfb_fusion"         — EXP-04: Factorized Bilinear
+        "cross_attn_fusion"  — EXP-05: Cross-Attention Bridge
+        "qformer_scratch"    — EXP-06: Q-Former tu dau
+        "perceiver_resampler"— EXP-07: Perceiver Resampler
+    """
+
+    name:               str    # ten model, xem danh sach o tren
+    blip2_model_name:   str    # HuggingFace model id cho BLIP-2 legacy
+    num_query_tokens:   int    # so query token cua Q-Former (mac dinh 32)
+    vision_width:       int    # chieu output cua ViT (CLIP ViT-L/14 = 1024)
+    hidden_size:        int    # chieu an cua Q-Former / BERT (mac dinh 768)
+    num_layers:         int    # so lop transformer (mac dinh 12)
+    num_heads:          int    # so dau attention (mac dinh 12)
+    intermediate_size:  int    # chieu FFN = 4 * hidden_size (mac dinh 3072)
+    dropout:            float  # xac suat dropout (mac dinh 0.1)
+    max_answer_length:  int    # so token toi da khi sinh cau tra loi (mac dinh 10)
+    fusion_output_size: int    # chieu an cua cac fusion baseline (mac dinh 1024)
+    num_answers:        int    # kich thuoc vocab cau tra loi VQAv2 (= 3129)
+    mode:               str    # "generate" hoac "classify"
 
 
 class DataConfig(TypedDict, total=False):
-    """``cfg["data"]`` block.
+    """
+    Block cfg["data"] trong file YAML.
 
-    Sprint-2 config-object interface (used by VQAv2Dataset / build_dataloader):
-        data_root / vqav2_dir / coco_dir / cache_dir compose all paths internally.
+    Duong dan du lieu duoc ghep tu:
+        {data_root}/{vqav2_dir}/  — chua cac file JSON cua VQAv2
+        {data_root}/{coco_dir}/   — chua anh COCO (train2014/, val2014/)
+        {data_root}/{cache_dir}/  — chua file HDF5 dac trung da trich xuat
 
-    Legacy flat-path interface (kept for backward compatibility):
-        train_annotation, val_annotation, … are full paths.
+    Cac truong legacy (giu lai de tuong thich nguoc):
+        train_annotation, val_annotation... — duong dan day du den tung file
     """
 
-    # ── Sprint-2 config-object fields ───────────────────────────────────────────
-    data_root:           str   # root directory for all data sub-folders
-    vqav2_dir:           str   # sub-folder with VQAv2 JSON files (relative to data_root)
-    coco_dir:            str   # sub-folder with COCO images       (relative to data_root)
-    cache_dir:           str   # sub-folder for HDF5 feature cache (relative to data_root)
-    train_size:          int   # number of training samples after stratified subset
-    val_size:            int   # number of validation samples after stratified subset
-    seed:                int   # random seed for stratified sampling
-    batch_size:          int   # batch size used by build_dataloader
-    # ── Shared ──────────────────────────────────────────────────────────────────
-    answer_list:         str   # optional path to pre-built answer vocab JSON
-    max_question_length: int   # token truncation length (default 50)
-    image_size:          int   # resize target (default 224)
-    num_workers:         int   # DataLoader worker processes (default 4)
-    # ── Legacy flat-path fields (backward compat) ───────────────────────────────
-    train_annotation:    str   # full path to v2_OpenEnded_mscoco_train2014_questions.json
-    val_annotation:      str   # full path to v2_OpenEnded_mscoco_val2014_questions.json
-    train_answers:       str   # full path to v2_mscoco_train2014_annotations.json
-    val_answers:         str   # full path to v2_mscoco_val2014_annotations.json
-    train_image_dir:     str   # full path to train2014/ directory
-    val_image_dir:       str   # full path to val2014/ directory
+    # Duong dan chinh (khuyen nghi dung)
+    data_root:           str   # thu muc goc chua toan bo data
+    vqav2_dir:           str   # ten thu muc chua JSON VQAv2 (tuong doi voi data_root)
+    coco_dir:            str   # ten thu muc chua anh COCO (tuong doi voi data_root)
+    cache_dir:           str   # ten thu muc chua HDF5 cache (tuong doi voi data_root)
+    train_size:          int   # so mau train sau khi lay subset (stratified)
+    val_size:            int   # so mau val sau khi lay subset
+    seed:                int   # random seed cho stratified sampling
+    batch_size:          int   # batch size cho DataLoader
+
+    # Dung chung
+    answer_list:         str   # duong dan den file vocab cau tra loi (ans2idx.json)
+    max_question_length: int   # do dai toi da cua cau hoi (so token, mac dinh 50)
+    image_size:          int   # kich thuoc anh resize truoc khi vao CLIP (mac dinh 224)
+    num_workers:         int   # so worker cua DataLoader (mac dinh 2 tren Colab)
+
+    # Truong legacy — duong dan day du (backward compat)
+    train_annotation:    str   # duong dan den file JSON cau hoi train
+    val_annotation:      str   # duong dan den file JSON cau hoi val
+    train_answers:       str   # duong dan den file JSON annotation train
+    val_answers:         str   # duong dan den file JSON annotation val
+    train_image_dir:     str   # duong dan den thu muc anh train2014/
+    val_image_dir:       str   # duong dan den thu muc anh val2014/
 
 
 class TrainingConfig(TypedDict, total=False):
-    """``cfg["training"]`` block in default.yaml."""
+    """Block cfg["training"] trong file YAML."""
 
-    output_dir:                   str    # checkpoint save directory
-    log_dir:                      str    # TensorBoard / WandB log directory
-    num_epochs:                   int
-    batch_size:                   int    # training batch size
-    eval_batch_size:              int    # validation batch size
-    learning_rate:                float
-    weight_decay:                 float
-    warmup_steps:                 int
-    gradient_clip:                float  # max-norm; 0 = disabled
-    gradient_accumulation_steps:  int
-    save_every:                   int    # save checkpoint every N epochs
-    eval_every:                   int    # evaluate every N epochs
-    seed:                         int
-    mixed_precision:              bool
-    resume_from:                  Optional[str]   # checkpoint path or null
+    output_dir:                   str    # thu muc luu checkpoint
+    log_dir:                      str    # thu muc luu log W&B / TensorBoard
+    num_epochs:                   int    # tong so epoch huan luyen
+    batch_size:                   int    # batch size huan luyen
+    eval_batch_size:              int    # batch size khi danh gia
+    learning_rate:                float  # learning rate ban dau
+    weight_decay:                 float  # he so weight decay cho AdamW
+    warmup_steps:                 int    # so buoc warmup LR
+    gradient_clip:                float  # nguong clip gradient (0 = tat)
+    gradient_accumulation_steps:  int    # so buoc tich luy gradient truoc moi optimizer step
+    save_every:                   int    # luu checkpoint moi N epoch
+    eval_every:                   int    # danh gia moi N epoch
+    seed:                         int    # random seed
+    mixed_precision:              bool   # dung fp16 AMP hay khong
+    resume_from:                  Optional[str]   # duong dan checkpoint de resume, hoac null
 
 
 class OptimizerConfig(TypedDict, total=False):
-    """``cfg["optimizer"]`` block."""
+    """Block cfg["optimizer"] trong file YAML."""
 
-    name:  str    # "adamw" | "adam" | "sgd"
-    betas: List[float]
-    eps:   float
+    name:  str          # "adamw" | "adam" | "sgd"
+    betas: List[float]  # he so beta cho Adam (mac dinh [0.9, 0.999])
+    eps:   float        # epsilon tranh chia zero (mac dinh 1e-8)
 
 
 class SchedulerConfig(TypedDict, total=False):
-    """``cfg["scheduler"]`` block."""
+    """Block cfg["scheduler"] trong file YAML."""
 
     name:   str    # "cosine" | "linear" | "constant"
-    min_lr: float
+    min_lr: float  # learning rate toi thieu o cuoi cosine decay (mac dinh 1e-6)
 
 
 class LoggingConfig(TypedDict, total=False):
-    """``cfg["logging"]`` block."""
+    """Block cfg["logging"] trong file YAML."""
 
-    use_wandb:  bool
-    project:    str
-    run_name:   Optional[str]
+    use_wandb:  bool         # bat/tat W&B logging
+    project:    str          # ten project tren W&B
+    run_name:   Optional[str]  # ten run tren W&B (vd: "exp01_lan1_khoa")
 
 
-# ===========================================================================
-# 8. Fusion model contracts
-# ===========================================================================
+# =============================================================================
+# 8. FusionInput / FusionOutput — Hop dong I/O cho cac fusion model
+#
+# Tat ca 7 EXP model deu nhan FusionInput va tra ra FusionOutput.
+# =============================================================================
 
 class FusionInput(TypedDict, total=False):
-    """Inputs to any fusion baseline forward() method.
+    """
+    Input cho phuong thuc forward() cua cac fusion model (EXP-01 den EXP-07).
 
-    ConcatFusion / BilinearFusion / MLBFusion
-    -----------------------------------------
-    ★ visual_features : torch.Tensor  [B, visual_dim]    – pooled visual rep.
-    ★ text_features   : torch.Tensor  [B, text_dim]      – pooled text rep.
+    EXP-01 den EXP-04 (dung pooled features):
+        visual_features : [B, 1024]  — dac trung anh da mean-pool
+        text_features   : [B, 768]   — CLS token cua BERT
 
-    AttentionFusion
-    ---------------
-    ★ visual_features : torch.Tensor  [B, N_tokens, visual_dim]
-    ★ text_features   : torch.Tensor  [B, text_dim]
-      visual_mask     : torch.Tensor  [B, N_tokens]  bool  True = keep
+    EXP-05 den EXP-07 (dung patch-level features):
+        visual_features : [B, 257, 1024]  — toan bo patch token tu CLIP
+        text_features   : [B, 768]
+        visual_mask     : [B, 257] bool   — True = giu lai token nay (tuy chon)
     """
 
-    visual_features: torch.Tensor
-    text_features:   torch.Tensor
-    visual_mask:     torch.Tensor
+    visual_features: torch.Tensor   # dac trung anh (pooled hoac patch-level)
+    text_features:   torch.Tensor   # dac trung cau hoi tu BERT
+    visual_mask:     torch.Tensor   # mask cho patch tokens (tuy chon, EXP-05..07)
 
 
 class FusionOutput(TypedDict):
-    """Return value of all fusion baseline forward() methods.
+    """
+    Output cua forward() cho tat ca fusion model.
 
-    logits : torch.Tensor  [B, num_answers], float32  — raw (pre-softmax) logits.
+    logits : [B, 3129] float32 — raw logit chua qua softmax
+             Trainer se tinh loss tu day bang VQALoss.
     """
 
     logits: torch.Tensor
 
 
-# ===========================================================================
-# 9. Runtime constants
-# ===========================================================================
+# =============================================================================
+# 9. Hang so runtime
+#
+# Tat ca hang so duoc dung trong nhieu file deu phai khai bao tai day.
+# KHONG hardcode con so nay o bat ky file nao khac.
+# =============================================================================
 
-# VQAv2 answer vocabulary size (3,129 most frequent answers in training set)
+# Kich thuoc vocab cau tra loi — 3129 cau tra loi pho bien nhat trong VQAv2
 ANSWER_VOCAB_SIZE: int = 3129
 
-# Default image resolution fed to the vision encoder
+# Kich thuoc anh dau vao CLIP ViT-L/14
 IMAGE_SIZE: int = 224
 
-# Q-Former defaults (must match QFormerConfig defaults)
-NUM_QUERY_TOKENS: int = 32
-QFORMER_HIDDEN_SIZE: int = 768
-VISION_ENCODER_WIDTH: int = 1024   # CLIP ViT-L/14 — must match pre_extract_features.py cache
+# Cau hinh mac dinh cho Q-Former (EXP-06)
+NUM_QUERY_TOKENS: int = 32        # so learnable query token
+QFORMER_HIDDEN_SIZE: int = 768    # chieu an — khop voi BERT-base
+VISION_ENCODER_WIDTH: int = 1024  # chieu output cua CLIP ViT-L/14
 
-# CLIP ViT-L/14 feature dimensions (used by pre_extract_features.py)
-CLIP_FEATURE_DIM: int = 1024    # ViT-L/14 output channel dimension
-CLIP_PATCH_TOKENS: int = 257    # 1 CLS + 256 patch tokens at 224×224
+# Thong so CLIP ViT-L/14 — phai khop voi cache HDF5 da trich xuat
+CLIP_FEATURE_DIM: int = 1024      # chieu output moi token
+CLIP_PATCH_TOKENS: int = 257      # 1 CLS + 256 patch token (anh 224x224)
 
-# Question tokenisation
-MAX_QUESTION_LENGTH: int = 50
+# Cau hoi
+MAX_QUESTION_LENGTH: int = 50     # do dai toi da sau khi tokenize (so token)
 
-# Answer generation
-MAX_ANSWER_LENGTH: int = 10        # maximum new tokens in generate mode
+# Sinh cau tra loi (generative mode)
+MAX_ANSWER_LENGTH: int = 10       # so token toi da khi generate
 
-# VQA soft-score normalisation denominator
-VQA_SCORE_DENOMINATOR: int = 3     # min(count / 3, 1.0)
+# Cong thuc tinh soft score: score = min(so_nguoi_chon / 3, 1.0)
+VQA_SCORE_DENOMINATOR: int = 3
 
-# Padding / ignore index for labels tensor
+# Index bi bo qua khi tinh CE loss (tieu chuan PyTorch)
 LABEL_IGNORE_INDEX: int = -100
 
-# Model name keys (must match ModelConfig.name values and fusion registry keys)
+# Ten model (phai khop voi gia tri cua ModelConfig.name va registry trong models/__init__.py)
 MODEL_BLIP2_VQA:           str = "blip2_vqa"
-MODEL_MEAN_LINEAR:          str = "mean_linear"          # EXP-01
-MODEL_CONCAT_FUSION:        str = "concat_fusion"         # EXP-02
-MODEL_MLB_FUSION:           str = "mlb_fusion"            # EXP-03
-MODEL_MFB_FUSION:           str = "mfb_fusion"            # EXP-04
-MODEL_CROSS_ATTN_FUSION:    str = "cross_attn_fusion"     # EXP-05
-MODEL_QFORMER_SCRATCH:      str = "qformer_scratch"       # EXP-06
-MODEL_PERCEIVER_RESAMPLER:  str = "perceiver_resampler"   # EXP-07
-# (giữ lại để tương thích ngược)
-MODEL_BILINEAR_FUSION:      str = "bilinear_fusion"
-MODEL_ATTENTION_FUSION:     str = "attention_fusion"
+MODEL_MEAN_LINEAR:         str = "mean_linear"           # EXP-01
+MODEL_CONCAT_FUSION:       str = "concat_fusion"          # EXP-02
+MODEL_MLB_FUSION:          str = "mlb_fusion"             # EXP-03
+MODEL_MFB_FUSION:          str = "mfb_fusion"             # EXP-04
+MODEL_CROSS_ATTN_FUSION:   str = "cross_attn_fusion"      # EXP-05
+MODEL_QFORMER_SCRATCH:     str = "qformer_scratch"        # EXP-06
+MODEL_PERCEIVER_RESAMPLER: str = "perceiver_resampler"    # EXP-07
+MODEL_BILINEAR_FUSION:     str = "bilinear_fusion"        # giu lai de tuong thich nguoc
+MODEL_ATTENTION_FUSION:    str = "attention_fusion"       # giu lai de tuong thich nguoc
 
+# Tap hop tat ca ten model hop le — dung de validate trong build_model()
 VALID_MODEL_NAMES = frozenset({
     MODEL_BLIP2_VQA,
     MODEL_MEAN_LINEAR,
@@ -438,26 +518,26 @@ VALID_MODEL_NAMES = frozenset({
     MODEL_ATTENTION_FUSION,
 })
 
-# Operating modes for BLIP2VQA
-MODE_GENERATE: str = "generate"
-MODE_CLASSIFY: str = "classify"
+# Che do hoat dong cua BLIP2VQA
+MODE_GENERATE: str = "generate"   # sinh van ban tu do (generative)
+MODE_CLASSIFY: str = "classify"   # phan loai trong 3129 cau tra loi (classification)
 VALID_MODES = frozenset({MODE_GENERATE, MODE_CLASSIFY})
 
-# Loss types for VQALoss
-LOSS_BCE:       str = "bce"
-LOSS_CE:        str = "ce"
-LOSS_KL:        str = "kl"
-LOSS_FOCAL_BCE: str = "focal_bce"   # Focal BCE — upweights hard/uncertain examples
+# Loai ham loss cho VQALoss
+LOSS_BCE:       str = "bce"        # Binary Cross-Entropy voi soft label (mac dinh)
+LOSS_CE:        str = "ce"         # Cross-Entropy voi hard label
+LOSS_KL:        str = "kl"         # KL Divergence
+LOSS_FOCAL_BCE: str = "focal_bce"  # Focal BCE — tang trong so mau kho hoc
 VALID_LOSS_TYPES = frozenset({LOSS_BCE, LOSS_CE, LOSS_KL, LOSS_FOCAL_BCE})
 
-# Optimizer names
-OPTIM_ADAMW: str = "adamw"
-OPTIM_ADAM:  str = "adam"
-OPTIM_SGD:   str = "sgd"
+# Ten optimizer
+OPTIM_ADAMW: str = "adamw"   # AdamW (mac dinh, phu hop voi transformer)
+OPTIM_ADAM:  str = "adam"    # Adam thong thuong
+OPTIM_SGD:   str = "sgd"     # SGD voi momentum
 VALID_OPTIMIZER_NAMES = frozenset({OPTIM_ADAMW, OPTIM_ADAM, OPTIM_SGD})
 
-# Scheduler names
-SCHED_COSINE:   str = "cosine"
-SCHED_LINEAR:   str = "linear"
-SCHED_CONSTANT: str = "constant"
+# Ten scheduler
+SCHED_COSINE:   str = "cosine"    # Cosine annealing (mac dinh)
+SCHED_LINEAR:   str = "linear"    # Giam tuyen tinh
+SCHED_CONSTANT: str = "constant"  # Giu nguyen LR
 VALID_SCHEDULER_NAMES = frozenset({SCHED_COSINE, SCHED_LINEAR, SCHED_CONSTANT})
