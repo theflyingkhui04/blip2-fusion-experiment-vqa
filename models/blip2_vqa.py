@@ -244,10 +244,7 @@ class BLIP2VQA(nn.Module):
                 )
         return outputs
 
-    # ------------------------------------------------------------------
     # Inference helpers
-    # ------------------------------------------------------------------
-
     @torch.no_grad()
     def generate_answers(
         self,

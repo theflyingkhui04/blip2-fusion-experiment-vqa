@@ -1,0 +1,76 @@
+# EXP-07: Perceiver Resampler (Flamingo-style)
+# Paper: Alayrac et al., NeurIPS 2022
+# Trainable params: ~58M | Input: FULL patch tokens [B, 257, 1024]
+# Batch: 12 (T4) / 32 (A100) | Est. time: 9-14h on T4
+#
+# LUU Y: EXP-07 can TOAN BO patch tokens — khong dung CLS-only cache.
+#   T4: chay batch=12, accum=3 -> effective batch=36
+#   Khuyen nghi: dung A100.
+#
+# Cach chay:
+#   python scripts/train.py --config configs/exp07.yaml \
+#       --data_root /content/drive/MyDrive/blip2_project/data \
+#       --answer_list /content/drive/MyDrive/blip2_project/data/ans2idx.json \
+#       --output_dir /content/drive/MyDrive/blip2_project/checkpoints/exp07 \
+#       --run_name exp07_lan1_<ten>
+
+model:
+  name: perceiver_resampler
+  vision_width: 1024             # CLIP ViT-L/14 patch dim
+  text_dim: 768
+  hidden_size: 768
+  num_query_tokens: 64           # M=64 latent vectors (khac exp05/06 dung 32)
+  num_layers: 4                  # so lop Perceiver
+  num_heads: 8
+  intermediate_size: 3072
+  fusion_output_size: 1024
+  num_answers: 3129
+  dropout: 0.1
+
+data:
+  data_root:    /content/drive/MyDrive/blip2_project/data
+  vqav2_dir:    vqav2
+  coco_dir:     coco
+  cache_dir:    cache
+
+  answer_list:  /content/drive/MyDrive/blip2_project/data/ans2idx.json
+
+  train_size:   443757
+  val_size:     214354
+  seed:         42
+
+  batch_size:   12               # T4: 12; A100: 32
+  max_question_length: 50
+  image_size:   224
+  num_workers:  2
+
+training:
+  output_dir:  /content/drive/MyDrive/blip2_project/checkpoints/exp07
+  log_dir:     /content/drive/MyDrive/blip2_project/logs/exp07
+  num_epochs:  10
+  eval_batch_size: 32
+  learning_rate: 1.0e-4
+  weight_decay:  0.05
+  warmup_steps:  1000
+  gradient_clip: 1.0
+  gradient_accumulation_steps: 3  # T4: 3 -> effective batch=36; A100: 1
+  save_every:  1
+  eval_every:  1
+  seed:        42
+  mixed_precision: true
+  resume_from: null
+
+optimizer:
+  name:  adamw
+  betas: [0.9, 0.999]
+  eps:   1.0e-8
+
+scheduler:
+  name:   cosine
+  min_lr: 1.0e-6
+
+logging:
+  use_wandb: true
+  project:   blip2-vqa-experiment
+  run_name:  exp07_lan1
+  wandb_run_id: null

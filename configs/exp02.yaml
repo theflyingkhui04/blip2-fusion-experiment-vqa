@@ -1,0 +1,71 @@
+# EXP-02: Concat + MLP
+# Trainable params: ~7.2M | Input: pooled CLS-only cache
+# Batch: 32 (T4) / 64 (A100) | Est. time: 2.5-3.7h on T4
+#
+# Cach chay:
+#   python scripts/train.py --config configs/exp02.yaml \
+#       --data_root /content/drive/MyDrive/blip2_project/data \
+#       --answer_list /content/drive/MyDrive/blip2_project/data/ans2idx.json \
+#       --output_dir /content/drive/MyDrive/blip2_project/checkpoints/exp02 \
+#       --run_name exp02_lan1_<ten>
+
+model:
+  name: concat_fusion
+  vision_width: 1024
+  text_dim: 768
+  hidden_size: 768
+  fusion_output_size: 1024       # hidden dim cua MLP
+  num_answers: 3129
+  dropout: 0.1
+  num_layers: 12
+  num_heads: 12
+  intermediate_size: 3072
+  num_query_tokens: 32
+
+data:
+  data_root:    /content/drive/MyDrive/blip2_project/data
+  vqav2_dir:    vqav2
+  coco_dir:     coco
+  cache_dir:    cache
+
+  answer_list:  /content/drive/MyDrive/blip2_project/data/ans2idx.json
+
+  train_size:   443757
+  val_size:     214354
+  seed:         42
+
+  batch_size:   32
+  max_question_length: 50
+  image_size:   224
+  num_workers:  2
+
+training:
+  output_dir:  /content/drive/MyDrive/blip2_project/checkpoints/exp02
+  log_dir:     /content/drive/MyDrive/blip2_project/logs/exp02
+  num_epochs:  10
+  eval_batch_size: 64
+  learning_rate: 1.0e-4
+  weight_decay:  0.05
+  warmup_steps:  1000
+  gradient_clip: 1.0
+  gradient_accumulation_steps: 1
+  save_every:  1
+  eval_every:  1
+  seed:        42
+  mixed_precision: true
+  resume_from: null
+
+optimizer:
+  name:  adamw
+  betas: [0.9, 0.999]
+  eps:   1.0e-8
+
+scheduler:
+  name:   cosine
+  min_lr: 1.0e-6
+
+logging:
+  use_wandb: true
+  project:   blip2-vqa-experiment
+  run_name:  exp02_lan1
+  wandb_run_id: null
