@@ -25,11 +25,11 @@ model:
 
 data:
   data_root:    /content/drive/MyDrive/blip2_project
-  vqav2_dir:    vqav2
-  coco_dir:     coco
+  vqav2_dir:    data/vqav2
+  coco_dir:     data/coco
   cache_dir:    cache
 
-  answer_list:  /content/drive/MyDrive/blip2_project/ans2idx.json
+  answer_list:  /content/drive/MyDrive/blip2_project/data/ans2idx.json
 
   train_size:   443757
   val_size:     214354

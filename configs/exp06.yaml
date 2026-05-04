@@ -33,15 +33,15 @@ model:
 
 data:
   # ╔══════════════════════════════════════════════════════════════════╗
-  # ║  Colab + Google Drive: đổi data_root → path trong Drive         ║
-  # ║  Ví dụ: /content/drive/MyDrive/VQAv2                           ║
+  # ║  Colab + Google Drive: đổi data_root → path trong Drive          ║
+  # ║  Ví dụ: /content/drive/MyDrive/VQAv2                             ║
   # ╚══════════════════════════════════════════════════════════════════╝
   data_root:    /content/drive/MyDrive/blip2_project
-  vqav2_dir:    vqav2            # {data_root}/vqav2/ chua JSON files
-  coco_dir:     coco             # {data_root}/coco/ chua train2014/ val2014/
-  cache_dir:    cache            # {data_root}/cache/ chua *.h5 cache
+  vqav2_dir:    data/vqav2      # {data_root}/data/vqav2/ chua JSON files
+  coco_dir:     data/coco       # {data_root}/data/coco/ chua train2014/ val2014/
+  cache_dir:    cache           # {data_root}/cache/ chua *.h5 cache
 
-  answer_list:  /content/drive/MyDrive/blip2_project/ans2idx.json
+  answer_list:  /content/drive/MyDrive/blip2_project/data/ans2idx.json
 
   # Kích thước subset — dùng toàn bộ VQAv2
   train_size:   443757

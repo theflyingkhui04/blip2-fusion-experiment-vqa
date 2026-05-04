@@ -24,14 +24,17 @@ model:
   num_query_tokens: 32
 
 data:
-  # data_root la thu muc cha chua tat ca cac thu muc con
-  # Cau truc: {data_root}/cache/, {data_root}/vqav2/, {data_root}/coco/
+  # Cau truc thu muc:
+  #   {data_root}/cache/           <- file .h5
+  #   {data_root}/data/vqav2/      <- JSON VQAv2
+  #   {data_root}/data/coco/       <- anh COCO
+  #   {data_root}/data/ans2idx.json
   data_root:    /content/drive/MyDrive/blip2_project
-  vqav2_dir:    vqav2
-  coco_dir:     coco
+  vqav2_dir:    data/vqav2
+  coco_dir:     data/coco
   cache_dir:    cache
 
-  answer_list:  /content/drive/MyDrive/blip2_project/ans2idx.json
+  answer_list:  /content/drive/MyDrive/blip2_project/data/ans2idx.json
 
   train_size:   443757
   val_size:     214354
