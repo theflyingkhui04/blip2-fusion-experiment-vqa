@@ -14,7 +14,7 @@ data:
   data_root: /content/drive/MyDrive/blip2_project
   vqav2_dir: data/vqav2
   coco_dir: data/coco
-  cache_dir: cache
+  cache_dir: cache_mini_20k_10k
   answer_list: /content/drive/MyDrive/blip2_project/data/ans2idx.json
   train_size: 443757
   val_size: 214354

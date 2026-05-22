@@ -66,6 +66,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--data_root", type=str, default=None)
+    parser.add_argument("--cache_dir", type=str, default=None)
+    parser.add_argument("--vqav2_dir", type=str, default=None)
+    parser.add_argument("--coco_dir", type=str, default=None)
+    parser.add_argument("--answer_list", type=str, default=None)
     return parser.parse_args()
 
 
@@ -75,6 +80,10 @@ def main() -> None:
     cfg_dict = load_config(args.config)
     if args.batch_size:
         cfg_dict.setdefault("data", {})["batch_size"] = args.batch_size
+    for arg_name in ("data_root", "cache_dir", "vqav2_dir", "coco_dir", "answer_list"):
+        arg_value = getattr(args, arg_name)
+        if arg_value:
+            cfg_dict.setdefault("data", {})[arg_name] = arg_value
     config = OmegaConf.create(cfg_dict)
 
     set_seed(int(getattr(config.training, "seed", 42)))
