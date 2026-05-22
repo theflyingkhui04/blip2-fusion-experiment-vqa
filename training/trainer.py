@@ -22,6 +22,7 @@ from configs.contracts import (
     KEY_ANSWER_TYPE,
     KEY_ATTENTION_MASK,
     KEY_BEST_VAL_METRIC,
+    KEY_EARLY_STOP_BAD_EPOCHS,
     KEY_EPOCH,
     KEY_GLOBAL_STEP,
     KEY_IMAGE_FEATURES,
@@ -85,6 +86,8 @@ class VQATrainer:
         text_encoder: Optional[nn.Module] = None,
         wandb_run=None,
         type_loss_weights: Optional[Dict[str, float]] = None,
+        early_stopping_patience: Optional[int] = None,
+        early_stopping_min_delta: float = 0.0,
     ) -> None:
         # type_loss_weights: e.g. {"other": 2.0, "number": 1.2, "yes/no": 1.0}
         # Per-batch samples của type có weight > 1.0 sẽ có loss được nhân thêm
@@ -113,6 +116,8 @@ class VQATrainer:
 
         # wandb_run: đối tượng wandb.Run hoặc None (không bắt buộc cài wandb)
         self.wandb_run = wandb_run
+        self.early_stopping_patience = early_stopping_patience
+        self.early_stopping_min_delta = early_stopping_min_delta
 
         self.model = self.model.to(self.device)
 
@@ -123,6 +128,7 @@ class VQATrainer:
 
         self.global_step = 0
         self.best_val_metric = float("-inf")
+        self.early_stop_bad_epochs = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -177,7 +183,17 @@ class VQATrainer:
 
             # Lưu checkpoint sau mỗi epoch
             metric = val_results.get("metric", -val_results[KEY_LOSS])
+            should_stop = self._update_early_stopping(metric)
             self._save_checkpoint(epoch, metric)
+            if should_stop:
+                logger.info(
+                    "Early stopping at epoch %d: metric has not improved by %.4f "
+                    "for %d validation epochs.",
+                    epoch,
+                    self.early_stopping_min_delta,
+                    self.early_stop_bad_epochs,
+                )
+                break
 
     def evaluate(self) -> EvalResult:
         """Chạy một lượt đánh giá trên tập validation.
@@ -519,13 +535,28 @@ class VQATrainer:
     # Checkpointing
     # ------------------------------------------------------------------
 
+    def _update_early_stopping(self, metric: float) -> bool:
+        patience = self.early_stopping_patience
+        if patience is None or patience <= 0:
+            return False
+        if metric >= self.best_val_metric + self.early_stopping_min_delta:
+            self.early_stop_bad_epochs = 0
+        else:
+            self.early_stop_bad_epochs += 1
+        return self.early_stop_bad_epochs >= patience
+
     def _save_checkpoint(self, epoch: int, metric: float) -> None:
+        is_best = metric > self.best_val_metric
+        if is_best:
+            self.best_val_metric = metric
+
         state = {
             KEY_EPOCH: epoch,
             KEY_GLOBAL_STEP: self.global_step,
             KEY_MODEL_STATE: self.model.state_dict(),
             KEY_OPTIM_STATE: self.optimizer.state_dict(),
-            KEY_BEST_VAL_METRIC: metric,
+            KEY_BEST_VAL_METRIC: self.best_val_metric,
+            KEY_EARLY_STOP_BAD_EPOCHS: self.early_stop_bad_epochs,
         }
         if self.scheduler is not None:
             state[KEY_SCHED_STATE] = self.scheduler.state_dict()
@@ -535,8 +566,7 @@ class VQATrainer:
         logger.info("Lưu checkpoint: %s", path)
 
         # Cập nhật best model nếu metric cải thiện
-        if metric > self.best_val_metric:
-            self.best_val_metric = metric
+        if is_best:
             best_path = self.output_dir / "best_model.pth"
             torch.save(state, best_path)
             logger.info("Best model mới được lưu (metric=%.4f)", metric)
@@ -561,6 +591,7 @@ class VQATrainer:
             self.scheduler.load_state_dict(state[KEY_SCHED_STATE])
         self.global_step = state.get(KEY_GLOBAL_STEP, 0)
         self.best_val_metric = state.get(KEY_BEST_VAL_METRIC, float("-inf"))
+        self.early_stop_bad_epochs = state.get(KEY_EARLY_STOP_BAD_EPOCHS, 0)
         epoch = state.get(KEY_EPOCH, 0)
         logger.info("Tải checkpoint từ %s (epoch %d)", checkpoint_path, epoch)
         return epoch

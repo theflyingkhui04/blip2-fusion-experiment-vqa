@@ -249,6 +249,12 @@ def main() -> None:
         mixed_precision=bool(getattr(config.training, "mixed_precision", True)),
         text_encoder=text_encoder,
         wandb_run=wandb_run,
+        early_stopping_patience=getattr(
+            config.training, "early_stopping_patience", None
+        ),
+        early_stopping_min_delta=float(
+            getattr(config.training, "early_stopping_min_delta", 0.0)
+        ),
     )
 
     # ------------------------------------------------------------------

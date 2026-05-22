@@ -38,6 +38,8 @@ training:
   eval_every: 1
   seed: 42
   mixed_precision: true
+  early_stopping_patience: 2
+  early_stopping_min_delta: 0.001
   resume_from: null
 
 optimizer:

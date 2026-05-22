@@ -128,6 +128,9 @@ KEY_SCHED_STATE     = "scheduler_state_dict"
 KEY_BEST_VAL_METRIC = "best_val_metric"
 # float — gia tri metric tot nhat tu truoc den gio (dung de luu best_model.pth)
 
+KEY_EARLY_STOP_BAD_EPOCHS = "early_stop_bad_epochs"
+# int — so epoch validation lien tiep khong du cai thien de reset early stopping
+
 KEY_CONFIG          = "config"
 # dict — toan bo config YAML tai thoi diem train
 
@@ -300,6 +303,7 @@ class CheckpointDict(TypedDict, total=False):
     model_state_dict:      dict   # trong so model (tu model.state_dict())
     optimizer_state_dict:  dict   # trang thai optimizer
     best_val_metric:       float  # metric tot nhat de so sanh
+    early_stop_bad_epochs: int    # so epoch validation khong du cai thien
     config:                dict   # toan bo config YAML
     scheduler_state_dict:  dict   # trang thai scheduler (neu co)
 
@@ -396,6 +400,8 @@ class TrainingConfig(TypedDict, total=False):
     eval_every:                   int    # danh gia moi N epoch
     seed:                         int    # random seed
     mixed_precision:              bool   # dung fp16 AMP hay khong
+    early_stopping_patience:       int    # so epoch khong cai thien truoc khi dung
+    early_stopping_min_delta:      float  # muc tang metric toi thieu de reset patience
     resume_from:                  Optional[str]   # duong dan checkpoint de resume, hoac null
 
 
