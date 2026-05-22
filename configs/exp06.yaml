@@ -1,85 +1,56 @@
-# EXP-06: Q-Former from Scratch
-#
-# Cách dùng trên Colab:
-#   python scripts/train.py --config configs/exp06.yaml
-#
-# Điều chỉnh bắt buộc:
-#   - data.data_root   → thư mục gốc chứa data trong Google Drive
-#   - data.answer_list → đường dẫn đến answer_list.json
-#
-# Cấu trúc thư mục dữ liệu mong đợi:
-#   {data_root}/{vqav2_dir}/v2_OpenEnded_mscoco_train2014_questions.json
-#   {data_root}/{vqav2_dir}/v2_mscoco_train2014_annotations.json
-#   {data_root}/{vqav2_dir}/v2_OpenEnded_mscoco_val2014_questions.json
-#   {data_root}/{vqav2_dir}/v2_mscoco_val2014_annotations.json
-#   {data_root}/{cache_dir}/train_features.h5     ← pre-extracted CLIP features
-#   {data_root}/{cache_dir}/val_features.h5
-#
-# Nếu chưa có HDF5 cache, chạy trước:
-#   python data/pre_extract_features.py --config configs/exp06.yaml
-
 model:
-  name: qformer_scratch          # EXP-06
-  # Q-Former hyperparameters
-  vision_width: 1024             # CLIP ViT-L/14 patch dim — phải khớp với cache
-  text_dim: 768                  # BERT-base CLS dim
-  hidden_size: 768               # chiều ẩn Q-Former (chuẩn BERT-base)
-  num_query_tokens: 32           # số learnable query tokens
-  num_layers: 12                 # số lớp Q-Former
-  num_heads: 12                  # số đầu attention
-  intermediate_size: 3072        # chiều FFN ẩn (768 × 4)
+  name: qformer_scratch
+  vision_width: 1024
+  text_dim: 768
+  hidden_size: 768
+  num_query_tokens: 32
+  num_layers: 12
+  num_heads: 12
+  intermediate_size: 3072
   dropout: 0.1
-  num_answers: 3129              # VQAv2 answer vocabulary size
+  num_answers: 3129
 
 data:
-  # ╔══════════════════════════════════════════════════════════════════╗
-  # ║  Colab + Google Drive: đổi data_root → path trong Drive          ║
-  # ║  Ví dụ: /content/drive/MyDrive/VQAv2                             ║
-  # ╚══════════════════════════════════════════════════════════════════╝
-  data_root:    /content/drive/MyDrive/blip2_project
-  vqav2_dir:    data/vqav2      # {data_root}/data/vqav2/ chua JSON files
-  coco_dir:     data/coco       # {data_root}/data/coco/ chua train2014/ val2014/
-  cache_dir:    cache           # {data_root}/cache/ chua *.h5 cache
-
-  answer_list:  /content/drive/MyDrive/blip2_project/data/ans2idx.json
-
-  # Kích thước subset — dùng toàn bộ VQAv2
-  train_size:   443757
-  val_size:     214354
-  seed:         42
-
-  batch_size:   32               # effective batch = 32 × gradient_accumulation_steps
+  data_root: /content/drive/MyDrive/blip2_project
+  vqav2_dir: data/vqav2
+  coco_dir: data/coco
+  cache_dir: cache
+  answer_list: /content/drive/MyDrive/blip2_project/data/ans2idx.json
+  train_size: 443757
+  val_size: 214354
+  seed: 42
+  batch_size: 32
   max_question_length: 50
-  image_size:   224
-  num_workers:  2                # Colab: 2 workers là đủ
+  image_size: 224
+  num_workers: 2
 
 training:
-  output_dir:  /content/drive/MyDrive/blip2_project/checkpoints/exp06
-  log_dir:     /content/drive/MyDrive/blip2_project/logs/exp06
-  num_epochs:  10
+  output_dir: /content/drive/MyDrive/blip2_project/checkpoints/exp06
+  log_dir: /content/drive/MyDrive/blip2_project/logs/exp06
+  num_epochs: 10
   eval_batch_size: 64
   learning_rate: 1.0e-4
-  weight_decay:  0.05
-  warmup_steps:  1000            # bước warmup (gradient steps)
+  weight_decay: 0.05
+  warmup_steps: 1000
   gradient_clip: 1.0
-  gradient_accumulation_steps: 2 # effective batch_size = 64
-  save_every:  1
-  eval_every:  1
-  seed:        42
+  gradient_accumulation_steps: 2
+  save_every: 1
+  eval_every: 1
+  seed: 42
   mixed_precision: true
   resume_from: null
 
 optimizer:
-  name:  adamw
+  name: adamw
   betas: [0.9, 0.999]
-  eps:   1.0e-8
+  eps: 1.0e-8
 
 scheduler:
-  name:   cosine
+  name: cosine
   min_lr: 1.0e-6
 
 logging:
   use_wandb: true
-  project:   blip2-vqa-experiment
-  run_name:  exp06_qformer_scratch
-  wandb_run_id: null        # để null khi train lần đầu; điền run ID cụ thể khi muốn resume cùng W&B run
+  project: blip2-vqa-experiment
+  run_name: exp06_qformer_scratch
+  wandb_run_id: null

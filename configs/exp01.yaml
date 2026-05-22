@@ -1,77 +1,57 @@
-# EXP-01: Mean Pooling + Linear (Baseline)
-# Trainable params: ~5.6M | Input: pooled CLS-only cache
-# Batch: 32 (T4) / 64 (A100) | Est. time: 2-3h on T4
-#
-# Cach chay:
-#   python scripts/train.py --config configs/exp01.yaml \
-#       --data_root /content/drive/MyDrive/blip2_project/data \
-#       --answer_list /content/drive/MyDrive/blip2_project/data/ans2idx.json \
-#       --output_dir /content/drive/MyDrive/blip2_project/checkpoints/exp01 \
-#       --run_name exp01_lan1_<ten>
-
 model:
   name: mean_linear
-  vision_width: 1024             # CLIP ViT-L/14 patch dim
-  text_dim: 768                  # BERT-base CLS dim
+  vision_width: 1024
+  text_dim: 768
   hidden_size: 768
   num_answers: 3129
   fusion_output_size: 1024
   dropout: 0.1
-  # Cac truong duoi khong dung boi EXP-01 nhung giu de tranh loi OmegaConf
   num_layers: 12
   num_heads: 12
   intermediate_size: 3072
   num_query_tokens: 32
 
 data:
-  # Cau truc thu muc:
-  #   {data_root}/cache/           <- file .h5
-  #   {data_root}/data/vqav2/      <- JSON VQAv2
-  #   {data_root}/data/coco/       <- anh COCO
-  #   {data_root}/data/ans2idx.json
-  data_root:    /content/drive/MyDrive/blip2_project
-  vqav2_dir:    data/vqav2
-  coco_dir:     data/coco
-  cache_dir:    cache
-
-  answer_list:  /content/drive/MyDrive/blip2_project/data/ans2idx.json
-
-  train_size:   443757
-  val_size:     214354
-  seed:         42
-
-  batch_size:   32
+  data_root: /content/drive/MyDrive/blip2_project
+  vqav2_dir: data/vqav2
+  coco_dir: data/coco
+  cache_dir: cache
+  answer_list: /content/drive/MyDrive/blip2_project/data/ans2idx.json
+  train_size: 443757
+  val_size: 214354
+  seed: 42
+  batch_size: 32
   max_question_length: 50
-  image_size:   224
-  num_workers:  2
+  image_size: 224
+  num_workers: 2
 
 training:
-  output_dir:  /content/drive/MyDrive/blip2_project/checkpoints/exp01
-  log_dir:     /content/drive/MyDrive/blip2_project/logs/exp01
-  num_epochs:  10
+  output_dir: /content/drive/MyDrive/blip2_project/checkpoints/exp01
+  log_dir: /content/drive/MyDrive/blip2_project/logs/exp01
+  num_epochs: 10
   eval_batch_size: 64
   learning_rate: 1.0e-4
-  weight_decay:  0.05
-  warmup_steps:  1000
+  weight_decay: 0.05
+  warmup_steps: 1000
   gradient_clip: 1.0
-  gradient_accumulation_steps: 1   # effective batch = 32
-  save_every:  1
-  eval_every:  1
-  seed:        42
+  gradient_accumulation_steps: 1
+  save_every: 1
+  eval_every: 1
+  seed: 42
   mixed_precision: true
   resume_from: null
 
 optimizer:
-  name:  adamw
+  name: adamw
   betas: [0.9, 0.999]
-  eps:   1.0e-8
+  eps: 1.0e-8
 
 scheduler:
-  name:   cosine
+  name: cosine
   min_lr: 1.0e-6
 
 logging:
   use_wandb: true
-  project:   blip2-vqa-experiment
-  run_name:  exp01_lan1            # doi thanh exp01_lan1_<ten> truoc khi chay
+  project: blip2-vqa-experiment
+  run_name: exp01_lan1
   wandb_run_id: null
