@@ -247,8 +247,33 @@ class VQAv2Dataset(Dataset):
                 "answer_type": ann.get("answer_type", "other"),
             })
 
+        self._h5 = None
+        if use_cache:
+            self._h5_path = os.path.join(data_root, cfg.cache_dir, meta["cache"])
+            if not os.path.exists(self._h5_path):
+                raise FileNotFoundError(
+                    f"Cache not found: {self._h5_path}\n"
+                    "Run scripts/pre_extract_features.py first, or set use_cache=False."
+                )
+            with h5py.File(self._h5_path, "r") as _h5:
+                cached_ids = set(_h5.keys())
+            before_cache_filter = len(self.samples)
+            self.samples = [
+                s for s in self.samples if str(s["image_id"]) in cached_ids
+            ]
+            if len(self.samples) != before_cache_filter:
+                print(
+                    f"[VQAv2Dataset/{split}] Cache filter kept "
+                    f"{len(self.samples):,}/{before_cache_filter:,} samples."
+                )
+
         # ── Stratified subset selection ──────────────────────────────────────
         subset_size = int(cfg.train_size if split == "train" else cfg.val_size)
+        if subset_size > len(self.samples):
+            print(
+                f"[VQAv2Dataset/{split}] WARNING: requested {subset_size:,} samples "
+                f"but cache/data coverage only has {len(self.samples):,}."
+            )
         seed = int(getattr(cfg, "seed", 42))
         indices = VQAv2Dataset._stratified_indices(self.samples, subset_size, seed)
         self.samples = [self.samples[i] for i in indices]
@@ -289,28 +314,6 @@ class VQAv2Dataset(Dataset):
             self.idx_to_answer = [""] * ANSWER_VOCAB_SIZE
             for ans, idx in self.answer_to_idx.items():
                 self.idx_to_answer[idx] = ans
-
-        # ── HDF5 cache ───────────────────────────────────────────────────────
-        self._h5 = None
-        if use_cache:
-            self._h5_path = os.path.join(data_root, cfg.cache_dir, meta["cache"])
-            if not os.path.exists(self._h5_path):
-                raise FileNotFoundError(
-                    f"Cache not found: {self._h5_path}\n"
-                    "Run scripts/pre_extract_features.py first, or set use_cache=False."
-                )
-            # Filter samples to only those whose image_id exists in the cache.
-            # This handles partial caches (e.g. smoke-test extractions) gracefully
-            # instead of crashing with KeyError mid-training.
-            with h5py.File(self._h5_path, "r") as _h5:
-                cached_ids = set(_h5.keys())  # set of str(image_id)
-            before = len(self.samples)
-            self.samples = [s for s in self.samples if str(s["image_id"]) in cached_ids]
-            dropped = before - len(self.samples)
-            if dropped:
-                print(f"[VQAv2Dataset/{split}] WARNING: {dropped:,} samples dropped "
-                      f"(image_id not in cache). Cache coverage: "
-                      f"{len(self.samples):,}/{before:,}.")
 
         print(f"[VQAv2Dataset/{split}] {len(self.samples):,} samples | "
               f"vocab={len(self.answer_to_idx):,} | use_cache={use_cache}")
