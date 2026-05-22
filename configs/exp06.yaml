@@ -14,10 +14,10 @@ data:
   data_root: /content/drive/MyDrive/blip2_project
   vqav2_dir: data/vqav2
   coco_dir: data/coco
-  cache_dir: cache_mini_20k_10k
+  cache_dir: cache
   answer_list: /content/drive/MyDrive/blip2_project/data/ans2idx.json
-  train_size: 443757
-  val_size: 214354
+  train_size: 100000
+  val_size: 40000
   seed: 42
   batch_size: 32
   max_question_length: 50
