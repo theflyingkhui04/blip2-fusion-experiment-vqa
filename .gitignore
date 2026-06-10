@@ -50,10 +50,6 @@ wandb/
 .DS_Store
 Thumbs.db
 
-# Results
-results/
-outputs/
-
 # Temporary
 tmp/
 temp/
